@@ -1,73 +1,348 @@
-import os
-import shlex
-import subprocess
+import os  # This import lets us work with file paths on your computer, for example to check whether a path is a file.
+import shlex  # This import provides a safe way to split a command string (like 'g++ main.cpp') into the list format Python's subprocess expects.
+import subprocess  # This import allows Python to start other programs on your computer, such as compilers like g++ or javac.
+import re  # This import allows us to detect line/column patterns (like 'file.cpp:10:5') inside compiler output text.
 
-from typing import Optional
+from typing import Optional  # This import lets us describe that a value might be missing (None), which helps document the behavior of our functions.
 
-from fastmcp import FastMCP
-
-
-mcp_server = FastMCP("air-gapped-code-tools")
+from fastmcp import FastMCP  # This import brings in the FastMCP class, which builds a Model Context Protocol server around our Python functions.
 
 
-@mcp_server.tool()
-def read_code(file_path: str) -> str:
-    """Read the contents of a text file from the local filesystem.
+# Create a single MCP server instance that will host all of our tools.
+mcp_server = FastMCP("air-gapped-code-tools")  # This line creates the MCP server with a short name so the AI client can recognize and connect to it.
 
-    Returns the contents or an error message.
+
+# Define the root directory that tools are allowed to access on disk.
+# All file paths used by tools must stay within this directory to maintain a simple sandbox.
+ALLOWED_ROOT = os.path.abspath(
+    os.getcwd()
+)  # This constant captures the server's start directory as the allowed sandbox root.
+
+
+def _contains_parent_traversal(path: str) -> bool:
+    """
+    Return True if the path tries to go up a directory using '..'.
+
+    This function checks the normalized path segments, which makes it clear
+    whether the caller attempted any parent-directory traversal.
     """
 
-    if not os.path.isfile(file_path):
-        return f"ERROR: File not found or not a regular file: {file_path}"
+    normalized = os.path.normpath(path)
+    parts = normalized.split(os.sep)
+    return ".." in parts
+
+
+def _ensure_within_allowed_root(path: str) -> str:
+    """
+    Normalize a path and ensure it is inside ALLOWED_ROOT.
+
+    Returns the absolute, normalized path if it is allowed.
+    Raises a ValueError if the path attempts to escape the sandbox.
+    """
+
+    if _contains_parent_traversal(path):
+        raise ValueError(
+            f"Sandbox violation: path uses '..' to traverse upwards: {path}"
+        )
+
+    if os.path.isabs(path):
+        absolute_path = os.path.abspath(path)
+    else:
+        absolute_path = os.path.abspath(os.path.join(ALLOWED_ROOT, path))
+
+    common_root = os.path.commonpath([ALLOWED_ROOT, absolute_path])
+    if common_root != ALLOWED_ROOT:
+        raise ValueError(
+            "Sandbox violation: path resolves outside the allowed project root.\n"
+            f"Requested path: {absolute_path}\n"
+            f"Allowed root:  {ALLOWED_ROOT}"
+        )
+
+    return absolute_path
+
+
+@mcp_server.tool()  # This decorator tells FastMCP that the function below should be exposed as an MCP tool the AI can call.
+def read_code(file_path: str) -> str:  # This function definition declares the read_code tool, which takes a file path as text and returns the file contents as text.
+    """
+    Read the contents of a text file from the local filesystem.
+
+    The function returns either the full file contents on success,
+    or a readable error message string if something goes wrong.
+    """  # This triple-quoted string explains in plain English what the read_code tool does and how its result should be interpreted.
+
+    # Explain our input in simple language.
+    # - file_path: a string giving either an absolute path like "C:\\my_folder\\code.cpp"
+    #              or a relative path like "src/main.cpp" from where the server is running.
 
     try:
-        with open(file_path, "r", encoding="utf-8") as file_handle:
-            return file_handle.read()
-    except UnicodeDecodeError:
+        # Enforce that the requested path is inside the ALLOWED_ROOT sandbox and
+        # does not rely on parent-directory traversal like "..".
+        absolute_path = _ensure_within_allowed_root(file_path)
+    except ValueError as sandbox_error:
+        return f"ERROR: {sandbox_error}"
+
+    # First, we check whether the path actually points to a real file on disk.
+    if not os.path.isfile(
+        absolute_path
+    ):  # This condition tests if file_path refers to a normal file; if it does not, we treat that as an error.
+        return f"ERROR: File not found or not a regular file: {absolute_path}"  # This return sends back a clear, human-friendly error message when the file does not exist.
+
+    try:  # This keyword starts a block where we will attempt to read the file, catching any problems that might occur.
+        with open(
+            absolute_path, "r", encoding="utf-8"
+        ) as file_handle:  # This line opens the file for reading as text using UTF-8, and gives us a handle named file_handle.
+            file_contents = file_handle.read()  # This line reads the entire file into a single string called file_contents.
+        return file_contents  # This return line sends the successfully read text back to the AI caller.
+    except UnicodeDecodeError:  # This branch runs if Python cannot interpret the file as UTF-8 text, which often means the file is binary or uses an unusual encoding.
         return (
             "ERROR: Could not decode the file as UTF-8 text. "
             "The file may be binary or use an unsupported encoding."
-        )
-    except Exception as error:
-        return f"ERROR: Unexpected problem while reading the file: {error!r}"
+        )  # This return gives a descriptive message so a non-coder understands why the file could not be read as normal text.
+    except Exception as error:  # This broad except catches any other unexpected problems, such as permission issues or transient I/O errors.
+        return f"ERROR: Unexpected problem while reading the file: {error!r}"  # This return embeds the technical error detail inside a human-readable sentence.
 
 
 @mcp_server.tool()
-def run_compiler(command: str, working_directory: Optional[str] = None) -> str:
-    """Run a compiler command and return its output or an error message."""
+def write_code(file_path: str, content: str) -> str:
+    """
+    Write text content to a file on disk inside the sandboxed project root.
+
+    If parent directories do not yet exist (but are still inside ALLOWED_ROOT),
+    they are created automatically. The file is written using UTF-8 encoding.
+    """
 
     try:
-        command_parts = shlex.split(command)
-    except ValueError as error:
-        return f"ERROR: Could not parse the command string: {error!r}"
+        absolute_path = _ensure_within_allowed_root(file_path)
+    except ValueError as sandbox_error:
+        return f"ERROR: {sandbox_error}"
 
-    if working_directory is not None and not os.path.isdir(working_directory):
-        return f"ERROR: The working directory does not exist or is not a directory: {working_directory}"
+    directory = os.path.dirname(absolute_path)
+    if directory:
+        try:
+            os.makedirs(directory, exist_ok=True)
+        except Exception as error:
+            return f"ERROR: Could not create parent directories: {error!r}"
 
     try:
-        completed_process = subprocess.run(
-            command_parts,
-            cwd=working_directory or None,
-            capture_output=True,
-            text=True,
-        )
-    except FileNotFoundError:
+        with open(absolute_path, "w", encoding="utf-8") as file_handle:
+            file_handle.write(content)
+        return f"SUCCESS: Wrote {len(content)} characters to {absolute_path}"
+    except Exception as error:
+        return f"ERROR: Unexpected problem while writing the file: {error!r}"
+
+
+def _extract_source_locations(text: str) -> set[tuple[str, str, Optional[str]]]:
+    """
+    Extract file/line(/column) locations from compiler output text.
+
+    Examples of patterns we detect:
+    - "file.cpp:10:5: error: ..."
+    - "path/to/file.c:42: warning: ..."
+    """
+
+    locations: set[tuple[str, str, Optional[str]]] = set()
+    if not text:
+        return locations
+
+    # First pattern: file:line:column:
+    pattern_with_column = re.compile(r"([^\s:]+):(\d+):(\d+)")
+    # Second pattern: file:line:
+    pattern_without_column = re.compile(r"([^\s:]+):(\d+)(?!:)")
+
+    for match in pattern_with_column.finditer(text):
+        file_name, line, column = match.groups()
+        locations.add((file_name, line, column))
+
+    for match in pattern_without_column.finditer(text):
+        file_name, line = match.groups()
+        # Only add if we do not already have a (file, line, column) entry.
+        if not any(
+            loc_file == file_name and loc_line == line
+            for (loc_file, loc_line, _loc_col) in locations
+        ):
+            locations.add((file_name, line, None))
+
+    return locations
+
+
+def _append_location_hints(
+    message: str, standard_output: str, error_output: str
+) -> str:
+    """
+    Append a hint section to a compiler message if we detect source locations.
+
+    This gives the LLM a clear suggestion to inspect specific file/line positions
+    in the source code when debugging compilation failures.
+    """
+
+    locations = set()
+    locations.update(_extract_source_locations(error_output))
+    locations.update(_extract_source_locations(standard_output))
+
+    if not locations:
+        return message
+
+    hint_lines = [
+        "",
+        "HINT: The compiler output references specific source locations.",
+        "You should inspect these files at the indicated lines (and columns, when present):",
+    ]
+
+    # Sort for deterministic, easy-to-skim output.
+    for file_name, line, column in sorted(locations):
+        if column is not None:
+            hint_lines.append(f"- {file_name}, line {line}, column {column}")
+        else:
+            hint_lines.append(f"- {file_name}, line {line}")
+
+    return message + "\n" + "\n".join(hint_lines)
+
+
+@mcp_server.tool()  # This decorator registers the next function as another MCP tool named run_compiler that the AI can invoke.
+def run_compiler(command: str, working_directory: Optional[str] = None) -> str:  # This function defines the run_compiler tool, which runs a local compile command and reports success or failure as text.
+    """
+    Run a local compiler command (for example 'g++' or 'javac') and return its result.
+
+    On success, the function returns a message that includes any output from the compiler.
+    On failure, the function returns a message that focuses on the error output so you can see what went wrong.
+    """  # This triple-quoted string documents in plain English how to use run_compiler and what kind of information it returns.
+
+    # Explain our inputs in simple language.
+    # - command: a single string exactly as you would type it in a terminal,
+    #            for example "g++ -Wall main.cpp" or "javac MyProgram.java".
+    # - working_directory: an optional folder path where the command should be run;
+    #                      if you leave it empty, the server runs the command in its own start folder.
+
+    # Convert the single command string into a list of parts understood by subprocess without using the shell.
+    try:  # This try block wraps the parsing step so we can handle malformed command strings gracefully.
+        command_parts = shlex.split(command)  # This line safely breaks the command string into pieces, for example "g++ -Wall main.cpp" becomes ["g++", "-Wall", "main.cpp"].
+    except ValueError as error:  # This except branch triggers if the command string has mismatched quotes or other parsing issues.
+        return f"ERROR: Could not parse the command string: {error!r}"  # This return gives a clear explanation that the problem is with how the command text was written.
+
+    # If the caller gave us a working directory, we double-check that it exists,
+    # is actually a directory, and remains inside the ALLOWED_ROOT sandbox.
+    if working_directory is not None:
+        try:
+            working_directory_resolved = _ensure_within_allowed_root(working_directory)
+        except ValueError as sandbox_error:
+            return f"ERROR: {sandbox_error}"
+
+        if not os.path.isdir(
+            working_directory_resolved
+        ):  # This condition ensures we do not try to run a command inside a folder that does not exist.
+            return f"ERROR: The working directory does not exist or is not a directory: {working_directory_resolved}"  # This return informs the user that their folder path input needs to be corrected.
+    else:
+        working_directory_resolved = None
+
+    try:  # This try block wraps the actual compiler execution, so we can catch operating system errors cleanly.
+        completed_process = subprocess.run(  # This call actually starts the compiler program and waits until it finishes.
+            command_parts,  # This argument supplies the compiler program and its arguments as a list, which is safer than passing a raw string into a shell.
+            cwd=working_directory_resolved or None,  # This argument tells subprocess which folder to treat as "current"; if None, it uses the server's start directory.
+            capture_output=True,  # This flag collects both standard output and error output so we can return them as text instead of printing them to a console.
+            text=True,  # This flag tells subprocess to decode the output as text strings instead of raw bytes, making the result easier to read.
+        )  # This closing parenthesis ends the subprocess.run call that executes the compiler.
+    except FileNotFoundError:  # This except branch runs when the system cannot even find the program named in the command, for example if 'g++' is not installed.
         return (
             "ERROR: The compiler program could not be found. "
             "Please confirm that the command name (such as 'g++' or 'javac') is installed and on your PATH."
+        )  # This return explains that the error is about the compiler not existing or not being visible to the system.
+    except Exception as error:  # This broad except catches any other unexpected operating system level failures.
+        return f"ERROR: Unexpected problem while running the compiler: {error!r}"  # This return gives a readable message along with the technical exception for debugging.
+
+    # At this point, the compiler ran and returned an exit code that tells us whether it succeeded or failed.
+    exit_code = completed_process.returncode  # This line saves the numerical exit code, where 0 normally means success and any non-zero value means failure.
+
+    # Clean up the compiler's outputs by stripping leading and trailing blank lines.
+    standard_output = (completed_process.stdout or "").strip()  # This line normalizes the normal output text, turning None into an empty string and removing extra whitespace.
+    error_output = (completed_process.stderr or "").strip()  # This line normalizes the error output text in the same way, so we can present it neatly.
+
+    # If the exit code is zero, we treat the run as successful and return the output in a success message.
+    if exit_code == 0:  # This condition checks whether the compiler reported success using the conventional exit code of zero.
+        if standard_output:  # This nested check looks to see if the compiler printed anything useful to standard output.
+            return f"SUCCESS (exit code 0):\n{standard_output}"  # This return reports both that the command worked and shows the compiler's normal output.
+        else:  # This branch covers the case where the compiler succeeded but printed nothing at all.
+            return "SUCCESS (exit code 0): The compiler finished successfully and produced no output."  # This return reassures you that success with no printed output is normal for many compilers.
+
+    # If we reach this point, the exit code is non-zero, which normally means something went wrong.
+    if error_output and standard_output:  # This condition handles the case where the compiler produced both normal output and error output.
+        combined_message = (
+            f"FAILURE (exit code {exit_code}):\n"
+            f"Standard output:\n{standard_output}\n\n"
+            f"Error output:\n{error_output}"
+        )  # This variable builds a detailed message that keeps normal and error text separate so you can see all the details.
+    elif error_output:  # This branch handles the common case where the compiler only produced error output.
+        combined_message = (
+            f"FAILURE (exit code {exit_code}):\n{error_output}"
+        )  # This variable focuses on the error text, because that usually explains what went wrong with the compilation.
+    elif standard_output:  # This branch covers the rare case where the compiler failed but only produced normal output.
+        combined_message = (
+            f"FAILURE (exit code {exit_code}):\n{standard_output}"
+        )  # This variable passes along the normal output so you at least see whatever messages the compiler generated.
+    else:  # This final branch covers the edge case where the compiler failed but printed absolutely nothing.
+        combined_message = (
+            f"FAILURE (exit code {exit_code}): The compiler failed but produced no output."
+        )  # This variable still reports the failure and exit code even though there is no text from the compiler itself.
+
+    # Enrich the failure message with explicit guidance about which file/line
+    # locations in the source code deserve attention.
+    return _append_location_hints(
+        combined_message, standard_output=standard_output, error_output=error_output
+    )  # This return sends whichever combined failure message we built back to the AI caller, possibly annotated with helpful source-location hints.
+
+
+@mcp_server.tool()
+def run_binary(path: str, timeout: int = 5) -> str:
+    """
+    Execute a compiled binary inside the sandbox and capture its output.
+
+    The binary must reside under ALLOWED_ROOT. A timeout (in seconds) is enforced
+    to prevent infinite loops or long-running programs from hanging the server.
+    """
+
+    try:
+        absolute_path = _ensure_within_allowed_root(path)
+    except ValueError as sandbox_error:
+        return f"ERROR: {sandbox_error}"
+
+    if not os.path.isfile(absolute_path):
+        return f"ERROR: Binary not found or not a regular file: {absolute_path}"
+
+    # Use the binary's directory as the working directory so any relative paths
+    # used by the program remain project-local.
+    working_directory = os.path.dirname(absolute_path) or ALLOWED_ROOT
+
+    try:
+        completed_process = subprocess.run(
+            [absolute_path],
+            cwd=working_directory,
+            capture_output=True,
+            text=True,
+            timeout=max(1, int(timeout)),
+        )
+    except subprocess.TimeoutExpired:
+        return (
+            f"ERROR: Binary execution exceeded timeout of {timeout} seconds and was terminated."
+        )
+    except PermissionError:
+        return (
+            "ERROR: Permission denied when trying to execute the binary. "
+            "Ensure the file has execute permissions."
         )
     except Exception as error:
-        return f"ERROR: Unexpected problem while running the compiler: {error!r}"
+        return f"ERROR: Unexpected problem while running the binary: {error!r}"
 
     exit_code = completed_process.returncode
     standard_output = (completed_process.stdout or "").strip()
     error_output = (completed_process.stderr or "").strip()
 
     if exit_code == 0:
-        if standard_output:
-            return f"SUCCESS (exit code 0):\n{standard_output}"
-        else:
-            return "SUCCESS (exit code 0): The compiler finished successfully and produced no output."
+        if standard_output or error_output:
+            return (
+                f"SUCCESS (exit code 0):\n"
+                f"Standard output:\n{standard_output or '[no standard output]'}\n\n"
+                f"Error output:\n{error_output or '[no error output]'}"
+            )
+        return "SUCCESS (exit code 0): The binary finished successfully and produced no output."
 
     if error_output and standard_output:
         combined_message = (
@@ -76,20 +351,54 @@ def run_compiler(command: str, working_directory: Optional[str] = None) -> str:
             f"Error output:\n{error_output}"
         )
     elif error_output:
-        combined_message = (
-            f"FAILURE (exit code {exit_code}):\n{error_output}"
-        )
+        combined_message = f"FAILURE (exit code {exit_code}):\n{error_output}"
     elif standard_output:
-        combined_message = (
-            f"FAILURE (exit code {exit_code}):\n{standard_output}"
-        )
+        combined_message = f"FAILURE (exit code {exit_code}):\n{standard_output}"
     else:
         combined_message = (
-            f"FAILURE (exit code {exit_code}): The compiler failed but produced no output."
+            f"FAILURE (exit code {exit_code}): The binary failed but produced no output."
         )
 
-    return combined_message  # This return sends whichever combined failure message we built back to the AI caller.
+    return combined_message
 
 
-if __name__ == "__main__":
-    mcp_server.run()
+@mcp_server.tool()
+def list_directory(path: str) -> str:
+    """
+    List the contents of a directory inside the sandboxed project root.
+
+    Returns a human-readable listing of files and subdirectories.
+    """
+
+    # Allow an empty string or '.' to mean the sandbox root.
+    target = path or "."
+
+    try:
+        absolute_path = _ensure_within_allowed_root(target)
+    except ValueError as sandbox_error:
+        return f"ERROR: {sandbox_error}"
+
+    if not os.path.isdir(absolute_path):
+        return f"ERROR: Not a directory or does not exist: {absolute_path}"
+
+    try:
+        entries = sorted(os.listdir(absolute_path))
+    except Exception as error:
+        return f"ERROR: Could not list directory contents: {error!r}"
+
+    if not entries:
+        return f"Directory is empty: {absolute_path}"
+
+    lines = [f"Listing for {absolute_path}:"]
+    for name in entries:
+        full_path = os.path.join(absolute_path, name)
+        if os.path.isdir(full_path):
+            lines.append(f"[DIR]  {name}")
+        else:
+            lines.append(f"[FILE] {name}")
+
+    return "\n".join(lines)
+
+
+if __name__ == "__main__":  # This line checks whether this file is being run directly as a script rather than being imported as a module.
+    mcp_server.run()  # This line starts the MCP server event loop, so the AI client can connect and call the read_code and run_compiler tools.

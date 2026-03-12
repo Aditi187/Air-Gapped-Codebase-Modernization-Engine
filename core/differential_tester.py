@@ -1,166 +1,382 @@
-"""
-Differential Tester for the Code Modernization Engine.
-
-Verifies functional parity between original and modernized code by compiling 
-and running both programs, then comparing their outputs.
-"""
-
 import os
 import subprocess
 import tempfile
+import time
+import shutil
+from dataclasses import dataclass
 from difflib import unified_diff
-import logging
+
+
+def resolve_gpp_exe(explicit_path: str | None = None) -> str:
+    if explicit_path:
+        return explicit_path
+    env_path = os.environ.get("GPP_EXE")
+    if env_path:
+        return env_path
+    which_path = shutil.which("g++")
+    if which_path:
+        return which_path
+    return "g++"
+
+
+def _verify_compiler(gpp_exe: str, timeout_seconds: int = 5) -> None:
+    try:
+        result = subprocess.run(
+            [gpp_exe, "--version"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=timeout_seconds,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"g++ sanity check failed: {exc!r}") from exc
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"g++ sanity check failed with exit code {result.returncode}: {result.stderr}"
+        )
+
+
+def compile_cpp_source(
+    code: str,
+    gpp_exe: str | None = None,
+    timeout_seconds: int = 10,
+) -> dict:
+    compiler = resolve_gpp_exe(gpp_exe)
+    _verify_compiler(compiler)
+
+    start_time = time.time()
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        cpp_path = os.path.join(tmp_dir, "modernized.cpp")
+        exe_path = os.path.join(tmp_dir, "modernized.exe")
+
+        with open(cpp_path, "w", encoding="utf-8") as cpp_file:
+            cpp_file.write(code)
+
+        cmd = [compiler, "-std=c++20", "-Wall", cpp_path, "-o", exe_path]
+
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                timeout=timeout_seconds,
+            )
+        except subprocess.TimeoutExpired:
+            elapsed_ms = int((time.time() - start_time) * 1000)
+            return {
+                "success": False,
+                "errors": [f"Compilation timed out after {timeout_seconds} seconds."],
+                "warnings": [],
+                "compilation_time_ms": elapsed_ms,
+                "raw_stdout": "",
+                "raw_stderr": "",
+                "compiler": compiler,
+            }
+        except FileNotFoundError:
+            elapsed_ms = int((time.time() - start_time) * 1000)
+            return {
+                "success": False,
+                "errors": [
+                    "g++ compiler not found. Please install a C++ compiler "
+                    "and ensure it is on your PATH or set GPP_EXE."
+                ],
+                "warnings": [],
+                "compilation_time_ms": elapsed_ms,
+                "raw_stdout": "",
+                "raw_stderr": "",
+                "compiler": compiler,
+            }
+        except Exception as exc:
+            elapsed_ms = int((time.time() - start_time) * 1000)
+            return {
+                "success": False,
+                "errors": [f"Compilation failed: {exc!r}"],
+                "warnings": [],
+                "compilation_time_ms": elapsed_ms,
+                "raw_stdout": "",
+                "raw_stderr": "",
+                "compiler": compiler,
+            }
+
+    elapsed_ms = int((time.time() - start_time) * 1000)
+    stdout_text = (result.stdout or "").strip()
+    stderr_text = (result.stderr or "").strip()
+
+    success = result.returncode == 0
+    error_lines = stderr_text.splitlines() if stderr_text else []
+    warning_lines = stdout_text.splitlines() if stdout_text else []
+
+    return {
+        "success": success,
+        "errors": error_lines,
+        "warnings": warning_lines,
+        "compilation_time_ms": elapsed_ms,
+        "raw_stdout": stdout_text,
+        "raw_stderr": stderr_text,
+        "compiler": compiler,
+    }
 
 
 def _compile_and_run_cpp(
     source_path: str,
     gpp_exe: str,
     tmp_dir: str,
-    exe_name: str
-) -> tuple[str, str, bool]:
-    """
-    Compiles a C++ source file and runs the resulting executable.
+    exe_name: str,
+    input_data: str | None = None,
+) -> dict:
+    _verify_compiler(gpp_exe)
 
-    Args:
-        source_path: Path to the C++ source file.
-        gpp_exe: Path to the g++ executable.
-        tmp_dir: Temporary directory for compilation.
-        exe_name: Name for the compiled executable.
-
-    Returns:
-        tuple[str, str, bool]: 
-            - stdout_text: Standard output from execution.
-            - stderr_text: Standard error from compilation/execution.
-            - success: True if both compile and run succeeded, False otherwise.
-    """
     exe_path = os.path.join(tmp_dir, exe_name)
-    compile_cmd = f'"{gpp_exe}" -std=c++20 -Wall "{source_path}" -o "{exe_path}"'
-    
+
+    compile_start = time.time()
+    compile_cmd = [gpp_exe, "-std=c++20", "-Wall", source_path, "-o", exe_path]
+
     try:
-        result = subprocess.run(
+        compile_result = subprocess.run(
             compile_cmd,
-            shell=True,
             capture_output=True,
             text=True,
+            encoding="utf-8",
             timeout=10,
         )
     except subprocess.TimeoutExpired as exc:
-        return "", f"Compilation timed out: {exc!r}", False
+        return {
+            "compile_success": False,
+            "run_success": False,
+            "stdout": "",
+            "stderr": f"Compilation timed out: {exc!r}",
+            "compile_time_ms": int((time.time() - compile_start) * 1000),
+            "run_time_ms": 0,
+        }
     except Exception as exc:
-        return "", f"Compilation failed: {exc!r}", False
+        return {
+            "compile_success": False,
+            "run_success": False,
+            "stdout": "",
+            "stderr": f"Compilation failed: {exc!r}",
+            "compile_time_ms": int((time.time() - compile_start) * 1000),
+            "run_time_ms": 0,
+        }
 
-    if result.returncode != 0:
-        stderr_text = (result.stderr or "").strip()
-        return "", stderr_text, False
+    compile_time_ms = int((time.time() - compile_start) * 1000)
+
+    if compile_result.returncode != 0:
+        stderr_text = (compile_result.stderr or "").strip()
+        return {
+            "compile_success": False,
+            "run_success": False,
+            "stdout": (compile_result.stdout or "").strip(),
+            "stderr": stderr_text,
+            "compile_time_ms": compile_time_ms,
+            "run_time_ms": 0,
+        }
+
+    run_start = time.time()
 
     try:
         run_result = subprocess.run(
-            exe_path,
-            shell=True,
+            [exe_path],
+            input=input_data if input_data is not None else None,
             capture_output=True,
             text=True,
+            encoding="utf-8",
             timeout=10,
         )
     except subprocess.TimeoutExpired as exc:
-        return "", f"Execution timed out: {exc!r}", False
+        return {
+            "compile_success": True,
+            "run_success": False,
+            "stdout": "",
+            "stderr": f"Execution timed out: {exc!r}",
+            "compile_time_ms": compile_time_ms,
+            "run_time_ms": int((time.time() - run_start) * 1000),
+        }
     except Exception as exc:
-        return "", f"Execution failed: {exc!r}", False
+        return {
+            "compile_success": True,
+            "run_success": False,
+            "stdout": "",
+            "stderr": f"Execution failed: {exc!r}",
+            "compile_time_ms": compile_time_ms,
+            "run_time_ms": int((time.time() - run_start) * 1000),
+        }
+
+    run_time_ms = int((time.time() - run_start) * 1000)
 
     stdout_text = (run_result.stdout or "").strip()
     stderr_text = (run_result.stderr or "").strip()
-    return stdout_text, stderr_text, True
+    run_success = run_result.returncode == 0
+
+    return {
+        "compile_success": True,
+        "run_success": run_success,
+        "stdout": stdout_text,
+        "stderr": stderr_text,
+        "compile_time_ms": compile_time_ms,
+        "run_time_ms": run_time_ms,
+    }
 
 
 def _normalize_output(text: str) -> str:
-    """
-    Normalizes program output for fuzzy comparison.
-
-    Handles line ending variations and trailing whitespace/newlines.
-
-    Args:
-        text: Output text to normalize.
-
-    Returns:
-        str: Normalized output string.
-    """
     normalized = text.replace("\r\n", "\n").replace("\r", "\n")
     lines = normalized.split("\n")
     stripped_lines = [line.rstrip() for line in lines]
-    
     while stripped_lines and stripped_lines[-1] == "":
         stripped_lines.pop()
-        
     return "\n".join(stripped_lines)
+
+
+def _extract_error_location(stderr_text: str, source_label: str) -> str | None:
+    for line in stderr_text.splitlines():
+        if source_label in line:
+            return line.strip()
+    return None
+
+
+@dataclass
+class DifferentialTestResult:
+    parity_ok: bool
+    diff_text: str
+    original: dict
+    modernized: dict
+    gpp_exe: str
 
 
 def run_differential_test(
     original_cpp_path: str,
     modernized_code: str,
-    gpp_exe: str = r"C:\msys64\mingw64\bin\g++.exe",
-) -> tuple[bool, str]:
-    """
-    Runs a differential test by comparing the execution of legacy and modernized code.
+    gpp_exe: str | None = None,
+    input_data: str | None = None,
+) -> dict:
+    compiler = resolve_gpp_exe(gpp_exe)
+    _verify_compiler(compiler)
 
-    Args:
-        original_cpp_path: Path to the original C++ source file.
-        modernized_code: Modernized C++ code as a string.
-        gpp_exe: Path to the g++ compiler executable.
-
-    Returns:
-        tuple[bool, str]: 
-            - parity_ok: True if outputs match, False otherwise.
-            - diff_text: Unified diff string if outputs differ, else empty string.
-    """
     if not os.path.isfile(original_cpp_path):
-        logging.error(f"Original file not found: {original_cpp_path}")
-        return False, ""
-        
+        return DifferentialTestResult(
+            parity_ok=False,
+            diff_text="",
+            original={
+                "compile_success": False,
+                "run_success": False,
+                "stdout": "",
+                "stderr": f"Original file not found: {original_cpp_path}",
+                "compile_time_ms": 0,
+                "run_time_ms": 0,
+            },
+            modernized={
+                "compile_success": False,
+                "run_success": False,
+                "stdout": "",
+                "stderr": "",
+                "compile_time_ms": 0,
+                "run_time_ms": 0,
+            },
+            gpp_exe=compiler,
+        ).__dict__
+
     if not modernized_code.strip():
-        logging.error("No modernized code provided.")
-        return False, ""
+        return DifferentialTestResult(
+            parity_ok=False,
+            diff_text="",
+            original={
+                "compile_success": False,
+                "run_success": False,
+                "stdout": "",
+                "stderr": "",
+                "compile_time_ms": 0,
+                "run_time_ms": 0,
+            },
+            modernized={
+                "compile_success": False,
+                "run_success": False,
+                "stdout": "",
+                "stderr": "No modernized code provided.",
+                "compile_time_ms": 0,
+                "run_time_ms": 0,
+            },
+            gpp_exe=compiler,
+        ).__dict__
 
     with tempfile.TemporaryDirectory() as tmp_dir:
         modernized_cpp_path = os.path.join(tmp_dir, "modernized.cpp")
-        with open(modernized_cpp_path, "w", encoding="utf-8") as file_handle:
-            file_handle.write(modernized_code)
 
-        logging.info("Compiling and running ORIGINAL (test.cpp)...")
-        orig_stdout, orig_stderr, orig_ok = _compile_and_run_cpp(
+        with open(modernized_cpp_path, "w", encoding="utf-8") as f:
+            f.write(modernized_code)
+
+        original_result = _compile_and_run_cpp(
             original_cpp_path,
-            gpp_exe,
+            compiler,
             tmp_dir,
             "original.exe",
+            input_data=input_data,
         )
-        
-        if not orig_ok:
-            logging.error("ORIGINAL FAILED:")
-            logging.error(orig_stderr)
-            return False, ""
 
-        logging.info("Compiling and running MODERNIZED code...")
-        mod_stdout, mod_stderr, mod_ok = _compile_and_run_cpp(
+        if not (original_result["compile_success"] and original_result["run_success"]):
+            return DifferentialTestResult(
+                parity_ok=False,
+                diff_text="",
+                original=original_result,
+                modernized={
+                    "compile_success": False,
+                    "run_success": False,
+                    "stdout": "",
+                    "stderr": "",
+                    "compile_time_ms": 0,
+                    "run_time_ms": 0,
+                },
+                gpp_exe=compiler,
+            ).__dict__
+
+        modernized_result = _compile_and_run_cpp(
             modernized_cpp_path,
-            gpp_exe,
+            compiler,
             tmp_dir,
             "modernized.exe",
+            input_data=input_data,
         )
-        
-        if not mod_ok:
-            logging.error("MODERNIZED FAILED:")
-            logging.error(mod_stderr)
-            return False, ""
 
-        norm_orig = _normalize_output(orig_stdout)
-        norm_mod = _normalize_output(mod_stdout)
+        if not modernized_result["compile_success"]:
+            location = _extract_error_location(
+                modernized_result["stderr"], os.path.basename(modernized_cpp_path)
+            )
+            if location:
+                modernized_result["stderr"] = (
+                    modernized_result["stderr"] + "\n" + f"First error location: {location}"
+                )
+            return DifferentialTestResult(
+                parity_ok=False,
+                diff_text="",
+                original=original_result,
+                modernized=modernized_result,
+                gpp_exe=compiler,
+            ).__dict__
+
+        if not modernized_result["run_success"]:
+            return DifferentialTestResult(
+                parity_ok=False,
+                diff_text="",
+                original=original_result,
+                modernized=modernized_result,
+                gpp_exe=compiler,
+            ).__dict__
+
+        norm_orig = _normalize_output(original_result["stdout"])
+        norm_mod = _normalize_output(modernized_result["stdout"])
 
         if norm_orig == norm_mod:
-            logging.info("PASSED: Functional Parity Confirmed")
-            return True, ""
+            return DifferentialTestResult(
+                parity_ok=True,
+                diff_text="",
+                original=original_result,
+                modernized=modernized_result,
+                gpp_exe=compiler,
+            ).__dict__
 
-        logging.warning("FAILED: Outputs differ. Generating diff...")
         orig_lines = (norm_orig + "\n").splitlines(keepends=True)
         mod_lines = (norm_mod + "\n").splitlines(keepends=True)
-        
+
         diff_lines = unified_diff(
             orig_lines,
             mod_lines,
@@ -171,31 +387,13 @@ def run_differential_test(
         diff_text_parts: list[str] = []
         for line in diff_lines:
             diff_text_parts.append(line)
-            print(line, end="")
 
         diff_text = "".join(diff_text_parts)
-        return False, diff_text
 
-
-if __name__ == "__main__":
-    import sys
-
-    if len(sys.argv) < 2:
-        print("Usage: python -m core.differential_tester <original.cpp> [modernized_code_string_or_path]")
-        sys.exit(1)
-
-    orig_path = sys.argv[1]
-
-    if len(sys.argv) >= 3:
-        modernized_arg = sys.argv[2]
-        if os.path.isfile(modernized_arg):
-            with open(modernized_arg, "r", encoding="utf-8") as f:
-                modernized_code = f.read()
-        else:
-            modernized_code = modernized_arg
-    else:
-        print("ERROR: Provide modernized code as second argument or path to file containing it.")
-        sys.exit(1)
-
-    success, _diff_text = run_differential_test(orig_path, modernized_code)
-    sys.exit(0 if success else 1)
+        return DifferentialTestResult(
+            parity_ok=False,
+            diff_text=diff_text,
+            original=original_result,
+            modernized=modernized_result,
+            gpp_exe=compiler,
+        ).__dict__
