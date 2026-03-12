@@ -1,13 +1,15 @@
-import os  
-import shlex  
-import subprocess  
-import re  
+import os
+import shlex
+import subprocess
+import re
 import glob
+import json
 import sys
+import threading
 from datetime import datetime
 
-from typing import Optional 
-from fastmcp import FastMCP  
+from typing import Optional
+from fastmcp import FastMCP
 
 # Make the project root importable so we can reach core.parser.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -19,36 +21,63 @@ except Exception:
     _PARSER_AVAILABLE = False
 
 
+mcp_server = FastMCP("air-gapped-code-tools")
 
-mcp_server = FastMCP("air-gapped-code-tools")  
+
+ALLOWED_ROOT = os.path.abspath(os.getcwd())
+
+# ---------------------------------------------------------------------------
+# Directories to skip during recursive scans (performance / noise).
+# ---------------------------------------------------------------------------
+_IGNORED_DIRS: set[str] = {
+    "node_modules", ".git", "build", "vcpkg_installed",
+    "__pycache__", ".venv", "venv", ".vs", ".cache", ".mypy_cache",
+}
+
+# ---------------------------------------------------------------------------
+# Whitelist of allowed compiler / build-tool binaries for run_compiler.
+# ---------------------------------------------------------------------------
+_ALLOWED_COMPILERS: set[str] = {
+    "g++", "gcc", "c++", "cc",
+    "clang++", "clang",
+    "make", "cmake", "ninja",
+}
 
 
-ALLOWED_ROOT = os.path.abspath(
-    os.getcwd()
-)  
+# ===================================================================
+# Standardised JSON result helper
+# ===================================================================
 
+def _make_result(status: str, **kwargs) -> str:
+    """Build a JSON-ready result dict for uniform tool output.
+
+    Every MCP tool returns this format so LLM / workflow consumers can
+    rely on a predictable schema::
+
+        {"status": "success"|"error", ...extra_fields}
+    """
+    payload: dict = {"status": status}
+    payload.update(kwargs)
+    return json.dumps(payload, indent=2, default=str)
+
+
+# ===================================================================
+# Sandbox helpers
+# ===================================================================
 
 def _contains_parent_traversal(path: str) -> bool:
-    """
-    Return True if the path tries to go up a directory using '..'.
-
-    This function checks the normalized path segments, which makes it clear
-    whether the caller attempted any parent-directory traversal.
-    """
-
+    """Return True if the path tries to go up a directory using '..'."""
     normalized = os.path.normpath(path)
     parts = normalized.split(os.sep)
     return ".." in parts
 
 
 def _ensure_within_allowed_root(path: str) -> str:
-    """
-    Normalize a path and ensure it is inside ALLOWED_ROOT.
+    """Normalise *path*, resolve symlinks, and verify it stays inside ALLOWED_ROOT.
 
-    Returns the absolute, normalized path if it is allowed.
-    Raises a ValueError if the path attempts to escape the sandbox.
+    Symlinks are resolved with ``os.path.realpath`` so that a symlink
+    pointing outside the sandbox cannot bypass the check.
     """
-
     if _contains_parent_traversal(path):
         raise ValueError(
             f"Sandbox violation: path uses '..' to traverse upwards: {path}"
@@ -59,107 +88,129 @@ def _ensure_within_allowed_root(path: str) -> str:
     else:
         absolute_path = os.path.abspath(os.path.join(ALLOWED_ROOT, path))
 
-    common_root = os.path.commonpath([ALLOWED_ROOT, absolute_path])
-    if common_root != ALLOWED_ROOT:
+    # Resolve symlinks *after* computing the absolute path.
+    resolved_path = os.path.realpath(absolute_path)
+    resolved_root = os.path.realpath(ALLOWED_ROOT)
+
+    common_root = os.path.commonpath([resolved_root, resolved_path])
+    if common_root != resolved_root:
         raise ValueError(
             "Sandbox violation: path resolves outside the allowed project root.\n"
-            f"Requested path: {absolute_path}\n"
-            f"Allowed root:  {ALLOWED_ROOT}"
+            f"Requested path: {resolved_path}\n"
+            f"Allowed root:   {resolved_root}"
         )
 
-    return absolute_path
+    return resolved_path
+
+
+def _validate_compiler_binary(command_parts: list[str]) -> str | None:
+    """Return ``None`` if the binary is allowed, or an error message."""
+    if not command_parts:
+        return "Empty command."
+    binary = os.path.basename(command_parts[0]).lower()
+    # Strip version suffixes (g++-12) and .exe on Windows.
+    base = re.sub(r'-\d+(\.\d+)*$', '', binary)
+    base = re.sub(r'\.exe$', '', base)
+    if base not in _ALLOWED_COMPILERS:
+        return (
+            f"Binary '{command_parts[0]}' is not in the allowed compiler whitelist: "
+            f"{sorted(_ALLOWED_COMPILERS)}"
+        )
+    return None
+
+
+def _path_has_ignored_component(filepath: str) -> bool:
+    """Return True if any path segment belongs to ``_IGNORED_DIRS``."""
+    parts = filepath.replace("\\", "/").split("/")
+    return any(p in _IGNORED_DIRS for p in parts)
 
 
 def _tool_log(tool_name: str, detail: str) -> None:
     """Write a concise tool-invocation log line to stderr."""
-
     print(f"Tool '{tool_name}' called: {detail}", file=sys.stderr, flush=True)
 
 
-@mcp_server.tool() 
-def read_code(file_path: str) -> str:  
+# ===================================================================
+# MCP tools
+# ===================================================================
+
+@mcp_server.tool()
+def read_code(file_path: str) -> str:
+    """Read the contents of a text file from the local filesystem.
+
+    Returns a JSON object with ``status``, ``content``, and ``file_path``
+    on success, or ``status`` and ``message`` on error.
     """
-    Read the contents of a text file from the local filesystem.
-
-    The function returns either the full file contents on success,
-    or a readable error message string if something goes wrong.
-    """  
-
     _tool_log("read_code", f"file_path='{file_path}'")
 
     try:
         absolute_path = _ensure_within_allowed_root(file_path)
     except ValueError as sandbox_error:
-        return f"ERROR: {sandbox_error}"
+        return _make_result("error", message=str(sandbox_error))
 
-  
-    if not os.path.isfile(
-        absolute_path
-    ):  
-        return f"ERROR: File not found or not a regular file: {absolute_path}"  # This return sends back a clear, human-friendly error message when the file does not exist.
+    if not os.path.isfile(absolute_path):
+        return _make_result("error", message=f"File not found or not a regular file: {absolute_path}")
 
-    try:  
-        with open(
-            absolute_path, "r", encoding="utf-8"
-        ) as file_handle:  # This line opens the file for reading as text using UTF-8, and gives us a handle named file_handle.
-            file_contents = file_handle.read()  # This line reads the entire file into a single string called file_contents.
-        return file_contents  # This return line sends the successfully read text back to the AI caller.
-    except UnicodeDecodeError:  # This branch runs if Python cannot interpret the file as UTF-8 text, which often means the file is binary or uses an unusual encoding.
-        return (
-            "ERROR: Could not decode the file as UTF-8 text. "
-            "The file may be binary or use an unsupported encoding."
-        )  # This return gives a descriptive message so a non-coder understands why the file could not be read as normal text.
-    except Exception as error:  # This broad except catches any other unexpected problems, such as permission issues or transient I/O errors.
-        return f"ERROR: Unexpected problem while reading the file: {error!r}"  # This return embeds the technical error detail inside a human-readable sentence.
+    try:
+        with open(absolute_path, "r", encoding="utf-8") as fh:
+            file_contents = fh.read()
+        return _make_result(
+            "success",
+            content=file_contents,
+            file_path=os.path.relpath(absolute_path, ALLOWED_ROOT),
+        )
+    except UnicodeDecodeError:
+        return _make_result(
+            "error",
+            message="Could not decode the file as UTF-8 text. The file may be binary or use an unsupported encoding.",
+        )
+    except Exception as error:
+        return _make_result("error", message=f"Unexpected problem while reading the file: {error!r}")
 
 
 @mcp_server.tool()
 def write_code(file_path: str, content: str) -> str:
-    """
-    Write text content to a file on disk inside the sandboxed project root.
+    """Write text content to a file inside the sandboxed project root.
 
-    If parent directories do not yet exist (but are still inside ALLOWED_ROOT),
-    they are created automatically. The file is written using UTF-8 encoding.
+    Parent directories are created automatically when they do not exist.
     """
-
     _tool_log("write_code", f"file_path='{file_path}', content_len={len(content)}")
 
     try:
         absolute_path = _ensure_within_allowed_root(file_path)
     except ValueError as sandbox_error:
-        return f"ERROR: {sandbox_error}"
+        return _make_result("error", message=str(sandbox_error))
 
     directory = os.path.dirname(absolute_path)
     if directory:
         try:
             os.makedirs(directory, exist_ok=True)
         except Exception as error:
-            return f"ERROR: Could not create parent directories: {error!r}"
+            return _make_result("error", message=f"Could not create parent directories: {error!r}")
 
     try:
-        with open(absolute_path, "w", encoding="utf-8") as file_handle:
-            file_handle.write(content)
-        return f"SUCCESS: Wrote {len(content)} characters to {absolute_path}"
+        with open(absolute_path, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        return _make_result(
+            "success",
+            message=f"Wrote {len(content)} characters to {absolute_path}",
+            bytes_written=len(content),
+        )
     except Exception as error:
-        return f"ERROR: Unexpected problem while writing the file: {error!r}"
+        return _make_result("error", message=f"Unexpected problem while writing the file: {error!r}")
 
+
+# ---------------------------------------------------------------------------
+# Compiler output helpers
+# ---------------------------------------------------------------------------
 
 def _extract_source_locations(text: str) -> set[tuple[str, str, Optional[str]]]:
-    """
-    Extract file/line(/column) locations from compiler output text.
-
-    Examples of patterns we detect:
-    - "file.cpp:10:5: error: ..."
-    - "path/to/file.c:42: warning: ..."
-    """
-
+    """Extract file/line(/column) locations from compiler output text."""
     locations: set[tuple[str, str, Optional[str]]] = set()
     if not text:
         return locations
 
-    # First pattern: file:line:column:
     pattern_with_column = re.compile(r"([^\s:]+):(\d+):(\d+)")
-    # Second pattern: file:line:
     pattern_without_column = re.compile(r"([^\s:]+):(\d+)(?!:)")
 
     for match in pattern_with_column.finditer(text):
@@ -168,158 +219,111 @@ def _extract_source_locations(text: str) -> set[tuple[str, str, Optional[str]]]:
 
     for match in pattern_without_column.finditer(text):
         file_name, line = match.groups()
-        # Only add if we do not already have a (file, line, column) entry.
-        if not any(
-            loc_file == file_name and loc_line == line
-            for (loc_file, loc_line, _loc_col) in locations
-        ):
+        if not any(f == file_name and l == line for (f, l, _) in locations):
             locations.add((file_name, line, None))
 
     return locations
 
 
-def _append_location_hints(
-    message: str, standard_output: str, error_output: str
-) -> str:
-    """
-    Append a hint section to a compiler message if we detect source locations.
-
-    This gives the LLM a clear suggestion to inspect specific file/line positions
-    in the source code when debugging compilation failures.
-    """
-
+def _build_location_hints(standard_output: str, error_output: str) -> list[dict]:
+    """Return structured location hints extracted from compiler output."""
     locations = set()
     locations.update(_extract_source_locations(error_output))
     locations.update(_extract_source_locations(standard_output))
 
-    if not locations:
-        return message
-
-    hint_lines = [
-        "",
-        "HINT: The compiler output references specific source locations.",
-        "You should inspect these files at the indicated lines (and columns, when present):",
-    ]
-
+    hints: list[dict] = []
     for file_name, line, column in sorted(locations):
+        entry: dict = {"file": file_name, "line": int(line)}
         if column is not None:
-            hint_lines.append(f"- {file_name}, line {line}, column {column}")
-        else:
-            hint_lines.append(f"- {file_name}, line {line}")
-
-    return message + "\n" + "\n".join(hint_lines)
+            entry["column"] = int(column)
+        hints.append(entry)
+    return hints
 
 
-@mcp_server.tool()  # This decorator registers the next function as another MCP tool named run_compiler that the AI can invoke.
-def run_compiler(command: str, working_directory: Optional[str] = None) -> str:  # This function defines the run_compiler tool, which runs a local compile command and reports success or failure as text.
+@mcp_server.tool()
+def run_compiler(command: str, working_directory: Optional[str] = None) -> str:
+    """Run a local compiler command and return its result as JSON.
+
+    Only whitelisted compiler binaries (g++, clang++, make, cmake, …) are
+    permitted.  Returns ``{status, exit_code, stdout, stderr, location_hints}``.
     """
-    Run a local compiler command (for example 'g++' or 'javac') and return its result.
-
-    On success, the function returns a message that includes any output from the compiler.
-    On failure, the function returns a message that focuses on the error output so you can see what went wrong.
-    """  
     _tool_log(
         "run_compiler",
         f"command='{command}', working_directory='{working_directory or '.'}'",
     )
 
-    try:   
-        command_parts = shlex.split(command)   
-    except ValueError as error:  # This except branch triggers if the command string has mismatched quotes or other parsing issues.
-        return f"ERROR: Could not parse the command string: {error!r}"  # This return gives a clear explanation that the problem is with how the command text was written.
+    try:
+        command_parts = shlex.split(command)
+    except ValueError as error:
+        return _make_result("error", message=f"Could not parse the command string: {error!r}")
+
+    # --- Compiler whitelist enforcement ---
+    rejection = _validate_compiler_binary(command_parts)
+    if rejection is not None:
+        return _make_result("error", message=rejection)
 
     if working_directory is not None:
         try:
             working_directory_resolved = _ensure_within_allowed_root(working_directory)
         except ValueError as sandbox_error:
-            return f"ERROR: {sandbox_error}"
+            return _make_result("error", message=str(sandbox_error))
 
-        if not os.path.isdir(
-            working_directory_resolved
-        ):  # This condition ensures we do not try to run a command inside a folder that does not exist.
-            return f"ERROR: The working directory does not exist or is not a directory: {working_directory_resolved}"  # This return informs the user that their folder path input needs to be corrected.
+        if not os.path.isdir(working_directory_resolved):
+            return _make_result(
+                "error",
+                message=f"The working directory does not exist or is not a directory: {working_directory_resolved}",
+            )
     else:
         working_directory_resolved = None
 
-    try:  # This try block wraps the actual compiler execution, so we can catch operating system errors cleanly.
-        completed_process = subprocess.run(  # This call actually starts the compiler program and waits until it finishes.
-            command_parts,  # This argument supplies the compiler program and its arguments as a list, which is safer than passing a raw string into a shell.
-            cwd=working_directory_resolved or None,  # This argument tells subprocess which folder to treat as "current"; if None, it uses the server's start directory.
-            capture_output=True,  # This flag collects both standard output and error output so we can return them as text instead of printing them to a console.
-            text=True,  # This flag tells subprocess to decode the output as text strings instead of raw bytes, making the result easier to read.
-        )  # This closing parenthesis ends the subprocess.run call that executes the compiler.
-    except FileNotFoundError:  # This except branch runs when the system cannot even find the program named in the command, for example if 'g++' is not installed.
-        return (
-            "ERROR: The compiler program could not be found. "
-            "Please confirm that the command name (such as 'g++' or 'javac') is installed and on your PATH."
-        )  # This return explains that the error is about the compiler not existing or not being visible to the system.
-    except Exception as error:  # This broad except catches any other unexpected operating system level failures.
-        return f"ERROR: Unexpected problem while running the compiler: {error!r}"  # This return gives a readable message along with the technical exception for debugging.
+    try:
+        completed_process = subprocess.run(
+            command_parts,
+            cwd=working_directory_resolved or None,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return _make_result(
+            "error",
+            message="The compiler program could not be found. "
+                    "Confirm the command name is installed and on your PATH.",
+        )
+    except Exception as error:
+        return _make_result("error", message=f"Unexpected problem while running the compiler: {error!r}")
 
-    # At this point, the compiler ran and returned an exit code that tells us whether it succeeded or failed.
-    exit_code = completed_process.returncode  # This line saves the numerical exit code, where 0 normally means success and any non-zero value means failure.
+    exit_code = completed_process.returncode
+    stdout = (completed_process.stdout or "").strip()
+    stderr = (completed_process.stderr or "").strip()
+    hints = _build_location_hints(stdout, stderr)
 
-    # Clean up the compiler's outputs by stripping leading and trailing blank lines.
-    standard_output = (completed_process.stdout or "").strip()  # This line normalizes the normal output text, turning None into an empty string and removing extra whitespace.
-    error_output = (completed_process.stderr or "").strip()  # This line normalizes the error output text in the same way, so we can present it neatly.
-
-    # If the exit code is zero, we treat the run as successful and return the output in a success message.
-    if exit_code == 0:  # This condition checks whether the compiler reported success using the conventional exit code of zero.
-        if standard_output:  # This nested check looks to see if the compiler printed anything useful to standard output.
-            return f"SUCCESS (exit code 0):\n{standard_output}"  # This return reports both that the command worked and shows the compiler's normal output.
-        else:  # This branch covers the case where the compiler succeeded but printed nothing at all.
-            return "SUCCESS (exit code 0): The compiler finished successfully and produced no output."  # This return reassures you that success with no printed output is normal for many compilers.
-
-    # If we reach this point, the exit code is non-zero, which normally means something went wrong.
-    if error_output and standard_output:  # This condition handles the case where the compiler produced both normal output and error output.
-        combined_message = (
-            f"FAILURE (exit code {exit_code}):\n"
-            f"Standard output:\n{standard_output}\n\n"
-            f"Error output:\n{error_output}"
-        )  # This variable builds a detailed message that keeps normal and error text separate so you can see all the details.
-    elif error_output:  # This branch handles the common case where the compiler only produced error output.
-        combined_message = (
-            f"FAILURE (exit code {exit_code}):\n{error_output}"
-        )  # This variable focuses on the error text, because that usually explains what went wrong with the compilation.
-    elif standard_output:  # This branch covers the rare case where the compiler failed but only produced normal output.
-        combined_message = (
-            f"FAILURE (exit code {exit_code}):\n{standard_output}"
-        )  # This variable passes along the normal output so you at least see whatever messages the compiler generated.
-    else:  # This final branch covers the edge case where the compiler failed but printed absolutely nothing.
-        combined_message = (
-            f"FAILURE (exit code {exit_code}): The compiler failed but produced no output."
-        )  # This variable still reports the failure and exit code even though there is no text from the compiler itself.
-
-    # Enrich the failure message with explicit guidance about which file/line
-    # locations in the source code deserve attention.
-    return _append_location_hints(
-        combined_message, standard_output=standard_output, error_output=error_output
-    )  # This return sends whichever combined failure message we built back to the AI caller, possibly annotated with helpful source-location hints.
+    return _make_result(
+        "success" if exit_code == 0 else "error",
+        exit_code=exit_code,
+        stdout=stdout,
+        stderr=stderr,
+        location_hints=hints,
+    )
 
 
 @mcp_server.tool()
 def run_binary(path: str, timeout: int = 5) -> str:
-    """
-    Execute a compiled binary inside the sandbox and capture its output.
+    """Execute a compiled binary inside the sandbox and capture its output.
 
-    The binary must reside under ALLOWED_ROOT. A timeout (in seconds) is enforced
-    to prevent infinite loops or long-running programs from hanging the server.
+    The binary must reside under ALLOWED_ROOT.  A timeout (seconds) prevents
+    infinite loops from hanging the server.
     """
-
     _tool_log("run_binary", f"path='{path}', timeout={timeout}")
 
     try:
         absolute_path = _ensure_within_allowed_root(path)
     except ValueError as sandbox_error:
-        return f"ERROR: {sandbox_error}"
+        return _make_result("error", message=str(sandbox_error))
 
     if not os.path.isfile(absolute_path):
-        return f"ERROR: Binary not found or not a regular file: {absolute_path}"
+        return _make_result("error", message=f"Binary not found or not a regular file: {absolute_path}")
 
-    # Use the binary's directory as the working directory so any relative paths
-    # used by the program remain project-local.
     working_directory = os.path.dirname(absolute_path) or ALLOWED_ROOT
-
     normalized_timeout = max(1, int(timeout))
     completed_process = None
     permission_retry_attempted = False
@@ -335,121 +339,88 @@ def run_binary(path: str, timeout: int = 5) -> str:
             )
             break
         except subprocess.TimeoutExpired:
-            return (
-                f"ERROR: Binary execution exceeded timeout of {timeout} seconds and was terminated."
+            return _make_result(
+                "error",
+                message=f"Binary execution exceeded timeout of {timeout} seconds and was terminated.",
             )
-        except PermissionError as permission_error:
+        except PermissionError as perm_err:
             if permission_retry_attempted:
-                return (
-                    "ERROR: Permission denied when trying to execute the binary, "
-                    "even after applying executable permissions. "
-                    f"Details: {permission_error!r}"
+                return _make_result(
+                    "error",
+                    message=f"Permission denied even after chmod 755: {perm_err!r}",
                 )
-
             permission_retry_attempted = True
-            _tool_log(
-                "run_binary",
-                f"permission denied for '{absolute_path}', attempting chmod 755 and retry",
-            )
+            _tool_log("run_binary", f"permission denied for '{absolute_path}', attempting chmod 755")
             try:
                 os.chmod(absolute_path, 0o755)
-            except Exception as chmod_error:
-                return (
-                    "ERROR: Permission denied when executing the binary and failed "
-                    f"to apply chmod 755: {chmod_error!r}"
+            except Exception as chmod_err:
+                return _make_result(
+                    "error",
+                    message=f"Permission denied and chmod 755 failed: {chmod_err!r}",
                 )
         except Exception as error:
-            return f"ERROR: Unexpected problem while running the binary: {error!r}"
+            return _make_result("error", message=f"Unexpected problem while running the binary: {error!r}")
 
     exit_code = completed_process.returncode
-    standard_output = (completed_process.stdout or "").strip()
-    error_output = (completed_process.stderr or "").strip()
+    stdout = (completed_process.stdout or "").strip()
+    stderr = (completed_process.stderr or "").strip()
 
-    if exit_code == 0:
-        if standard_output or error_output:
-            return (
-                f"SUCCESS (exit code 0):\n"
-                f"Standard output:\n{standard_output or '[no standard output]'}\n\n"
-                f"Error output:\n{error_output or '[no error output]'}"
-            )
-        return "SUCCESS (exit code 0): The binary finished successfully and produced no output."
-
-    if error_output and standard_output:
-        combined_message = (
-            f"FAILURE (exit code {exit_code}):\n"
-            f"Standard output:\n{standard_output}\n\n"
-            f"Error output:\n{error_output}"
-        )
-    elif error_output:
-        combined_message = f"FAILURE (exit code {exit_code}):\n{error_output}"
-    elif standard_output:
-        combined_message = f"FAILURE (exit code {exit_code}):\n{standard_output}"
-    else:
-        combined_message = (
-            f"FAILURE (exit code {exit_code}): The binary failed but produced no output."
-        )
-
-    return combined_message
+    return _make_result(
+        "success" if exit_code == 0 else "error",
+        exit_code=exit_code,
+        stdout=stdout,
+        stderr=stderr,
+    )
 
 
 @mcp_server.tool()
 def list_directory(path: str) -> str:
-    """
-    List the contents of a directory inside the sandboxed project root.
-
-    Returns a human-readable listing of files and subdirectories.
-    """
-
+    """List the contents of a directory inside the sandboxed project root."""
     _tool_log("list_directory", f"path='{path}'")
 
-    # Allow an empty string or '.' to mean the sandbox root.
     target = path or "."
-
     try:
         absolute_path = _ensure_within_allowed_root(target)
     except ValueError as sandbox_error:
-        return f"ERROR: {sandbox_error}"
+        return _make_result("error", message=str(sandbox_error))
 
     if not os.path.isdir(absolute_path):
-        return f"ERROR: Not a directory or does not exist: {absolute_path}"
+        return _make_result("error", message=f"Not a directory or does not exist: {absolute_path}")
 
     try:
         entries = sorted(os.listdir(absolute_path))
     except Exception as error:
-        return f"ERROR: Could not list directory contents: {error!r}"
+        return _make_result("error", message=f"Could not list directory contents: {error!r}")
 
-    if not entries:
-        return f"Directory is empty: {absolute_path}"
-
-    lines = [f"Listing for {absolute_path}:"]
+    items: list[dict] = []
     for name in entries:
-        full_path = os.path.join(absolute_path, name)
-        if os.path.isdir(full_path):
-            lines.append(f"[DIR]  {name}")
-        else:
-            lines.append(f"[FILE] {name}")
+        full = os.path.join(absolute_path, name)
+        items.append({"name": name, "type": "directory" if os.path.isdir(full) else "file"})
 
-    return "\n".join(lines)
+    return _make_result(
+        "success",
+        directory=os.path.relpath(absolute_path, ALLOWED_ROOT),
+        entries=items,
+    )
 
 
 @mcp_server.tool()
 def list_tree(path: str, depth: int = 2) -> str:
-    """
-    Render a visual directory tree from a path inside the sandbox.
+    """Render a visual directory tree from a path inside the sandbox.
 
-    The depth parameter controls how many nested levels are expanded.
+    Directories in ``_IGNORED_DIRS`` (node_modules, .git, build,
+    vcpkg_installed, …) are skipped automatically to avoid noise.
     """
-
     _tool_log("list_tree", f"path='{path}', depth={depth}")
 
     target = path or "."
     try:
         absolute_path = _ensure_within_allowed_root(target)
     except ValueError as sandbox_error:
-        return f"ERROR: {sandbox_error}"
+        return _make_result("error", message=str(sandbox_error))
 
     if not os.path.isdir(absolute_path):
-        return f"ERROR: Not a directory or does not exist: {absolute_path}"
+        return _make_result("error", message=f"Not a directory or does not exist: {absolute_path}")
 
     max_depth = max(0, int(depth))
     root_display = os.path.relpath(absolute_path, ALLOWED_ROOT)
@@ -461,12 +432,17 @@ def list_tree(path: str, depth: int = 2) -> str:
     def _walk(current_path: str, prefix: str, current_depth: int) -> None:
         if current_depth >= max_depth:
             return
-
         try:
             entries = sorted(os.listdir(current_path))
         except Exception as error:
             lines.append(f"{prefix}[ERROR] {error!r}")
             return
+
+        # Filter ignored directories.
+        entries = [
+            e for e in entries
+            if not (os.path.isdir(os.path.join(current_path, e)) and e in _IGNORED_DIRS)
+        ]
 
         for index, entry in enumerate(entries):
             full_path = os.path.join(current_path, entry)
@@ -481,35 +457,36 @@ def list_tree(path: str, depth: int = 2) -> str:
                 lines.append(f"{prefix}{connector}{entry}")
 
     _walk(absolute_path, prefix="", current_depth=0)
-    return "\n".join(lines)
+
+    return _make_result("success", tree="\n".join(lines))
 
 
 @mcp_server.tool()
 def search_code(query: str, file_pattern: str = "*") -> str:
-    """
-    Search text across project files using glob + regex.
+    """Search text across project files using glob + regex.
 
-    Returns matching lines in a grep-like "file:line: content" format.
+    Directories in ``_IGNORED_DIRS`` are automatically excluded.
+    Returns a JSON object with ``matches`` and metadata.
     """
-
     _tool_log("search_code", f"query='{query}', file_pattern='{file_pattern}'")
 
     if not query:
-        return "ERROR: Query must be a non-empty regex string."
+        return _make_result("error", message="Query must be a non-empty regex string.")
 
     try:
         regex = re.compile(query)
     except re.error as regex_error:
-        return f"ERROR: Invalid regex query: {regex_error}"
+        return _make_result("error", message=f"Invalid regex query: {regex_error}")
 
     pattern = file_pattern or "*"
     glob_pattern = os.path.join(ALLOWED_ROOT, "**", pattern)
     candidate_paths = glob.glob(glob_pattern, recursive=True)
 
-    # Keep only regular files inside ALLOWED_ROOT.
     files: list[str] = []
     for matched in candidate_paths:
         if not os.path.isfile(matched):
+            continue
+        if _path_has_ignored_component(matched):
             continue
         try:
             _ensure_within_allowed_root(matched)
@@ -519,9 +496,9 @@ def search_code(query: str, file_pattern: str = "*") -> str:
 
     files = sorted(set(files))
     if not files:
-        return f"No files matched pattern '{pattern}'."
+        return _make_result("success", matches=[], files_scanned=0, message=f"No files matched pattern '{pattern}'.")
 
-    matches: list[str] = []
+    matches: list[dict] = []
     files_scanned = 0
     files_with_decode_errors = 0
     max_results = 500
@@ -533,7 +510,11 @@ def search_code(query: str, file_pattern: str = "*") -> str:
                 for line_number, line_text in enumerate(handle, start=1):
                     if regex.search(line_text):
                         rel_path = os.path.relpath(file_path, ALLOWED_ROOT)
-                        matches.append(f"{rel_path}:{line_number}: {line_text.rstrip()}")
+                        matches.append({
+                            "file": rel_path,
+                            "line": line_number,
+                            "text": line_text.rstrip(),
+                        })
                         if len(matches) >= max_results:
                             break
         except UnicodeDecodeError:
@@ -544,41 +525,28 @@ def search_code(query: str, file_pattern: str = "*") -> str:
         if len(matches) >= max_results:
             break
 
-    if not matches:
-        return (
-            f"No matches found for /{query}/ across {files_scanned} files "
-            f"(pattern='{pattern}')."
-        )
-
-    header = [
-        f"Found {len(matches)} matches for /{query}/ in {files_scanned} files "
-        f"(pattern='{pattern}')."
-    ]
-    if files_with_decode_errors:
-        header.append(
-            f"Skipped {files_with_decode_errors} non-text file(s) due to UTF-8 decode errors."
-        )
-    if len(matches) >= max_results:
-        header.append(f"Results truncated at {max_results} matches.")
-
-    return "\n".join(header + [""] + matches)
+    return _make_result(
+        "success",
+        matches=matches,
+        total_matches=len(matches),
+        files_scanned=files_scanned,
+        skipped_decode_errors=files_with_decode_errors,
+        truncated=len(matches) >= max_results,
+    )
 
 
 @mcp_server.tool()
 def get_file_info(file_path: str) -> str:
-    """
-    Return metadata for a file: size, modified time, and line count.
-    """
-
+    """Return metadata for a file: size, modified time, and line count."""
     _tool_log("get_file_info", f"file_path='{file_path}'")
 
     try:
         absolute_path = _ensure_within_allowed_root(file_path)
     except ValueError as sandbox_error:
-        return f"ERROR: {sandbox_error}"
+        return _make_result("error", message=str(sandbox_error))
 
     if not os.path.isfile(absolute_path):
-        return f"ERROR: File not found or not a regular file: {absolute_path}"
+        return _make_result("error", message=f"File not found or not a regular file: {absolute_path}")
 
     try:
         stat_info = os.stat(absolute_path)
@@ -590,25 +558,25 @@ def get_file_info(file_path: str) -> str:
             for _ in handle:
                 line_count += 1
 
-        relative_path = os.path.relpath(absolute_path, ALLOWED_ROOT)
-        return (
-            f"File: {relative_path}\n"
-            f"Size (bytes): {size_bytes}\n"
-            f"Last modified: {modified_iso}\n"
-            f"Line count: {line_count}"
+        return _make_result(
+            "success",
+            file_path=os.path.relpath(absolute_path, ALLOWED_ROOT),
+            size_bytes=size_bytes,
+            last_modified=modified_iso,
+            line_count=line_count,
         )
     except UnicodeDecodeError:
-        return (
-            "ERROR: Could not decode the file as UTF-8 for line counting. "
-            "File may be binary or use a different encoding."
+        return _make_result(
+            "error",
+            message="Could not decode the file as UTF-8 for line counting. File may be binary.",
         )
     except Exception as error:
-        return f"ERROR: Unexpected problem while gathering file info: {error!r}"
+        return _make_result("error", message=f"Unexpected problem while gathering file info: {error!r}")
 
 
-# ---------------------------------------------------------------------------
+# ===================================================================
 # Helpers for get_context_for_function
-# ---------------------------------------------------------------------------
+# ===================================================================
 
 _PRIMITIVE_TYPES: set[str] = {
     "int", "float", "double", "char", "bool", "void", "long", "short",
@@ -616,55 +584,158 @@ _PRIMITIVE_TYPES: set[str] = {
     "uint8_t", "uint16_t", "uint32_t", "uint64_t",
     "int8_t",  "int16_t",  "int32_t",  "int64_t",
     "wchar_t", "char8_t", "char16_t", "char32_t",
-    # common macros / keywords that look like identifiers
     "const", "static", "inline", "virtual", "explicit", "constexpr",
     "override", "final", "typename", "class", "struct", "enum",
     "template", "namespace", "return", "new", "delete", "nullptr",
+    "true", "false", "using", "typedef", "public", "private", "protected",
 }
 
 
-def _extract_candidate_type_names(text: str) -> list[str]:
-    """Return unique identifier tokens from *text* that might be custom C++ types.
+def _extract_template_arguments(text: str) -> list[str]:
+    """Extract the top-level comma-separated fragments from inside ``<…>``.
 
-    Filters out primitive types, keywords, and ``std::`` identifiers.
+    Handles nesting so ``std::map<std::string, MyRecord>`` yields
+    ``["std::string", "MyRecord"]`` rather than splitting mid-token.
     """
-    tokens = re.findall(r'\b[A-Za-z_][A-Za-z0-9_]*\b', text)
+    args: list[str] = []
+    depth = 0
+    current: list[str] = []
+
+    for ch in text:
+        if ch == '<':
+            depth += 1
+            if depth == 1:
+                current = []
+                continue
+        elif ch == '>':
+            depth -= 1
+            if depth == 0 and current:
+                args.append(''.join(current).strip())
+                current = []
+                continue
+        if depth >= 1:
+            current.append(ch)
+
+    return args
+
+
+def _extract_candidate_type_names(text: str) -> list[str]:
+    """Return identifier tokens from *text* that might be custom C++ types.
+
+    Improvements over a naive word-boundary scanner:
+    - recursively unpacks template arguments (``std::vector<MyType>`` yields MyType)
+    - extracts both fully-qualified names (``Foo::Bar``) and their leaf identifiers
+    """
+    # Expand template arguments into the search text.
+    queue = list(_extract_template_arguments(text))
+    all_inner: list[str] = []
+    while queue:
+        fragment = queue.pop()
+        all_inner.append(fragment)
+        queue.extend(_extract_template_arguments(fragment))
+
+    combined = text + " " + " ".join(all_inner)
+
+    # Extract qualified identifiers (Foo::Bar::Baz).
+    qualified = re.findall(r'\b([A-Za-z_]\w*(?:::[A-Za-z_]\w*)+)\b', combined)
+    # Extract simple identifiers.
+    simple = re.findall(r'\b([A-Za-z_][A-Za-z0-9_]*)\b', combined)
+
     seen: set[str] = set()
     result: list[str] = []
-    for tok in tokens:
-        if tok in seen or tok in _PRIMITIVE_TYPES or tok.startswith("std"):
+
+    for tok in qualified + simple:
+        if tok in seen:
+            continue
+        if tok in _PRIMITIVE_TYPES:
+            seen.add(tok)
+            continue
+        # Skip pure std:: names.
+        if tok.startswith("std::") or tok == "std":
+            seen.add(tok)
             continue
         seen.add(tok)
         result.append(tok)
+
+    # Also extract the leaf component of qualified user names for lookup.
+    for qn in qualified:
+        if qn.startswith("std::"):
+            continue
+        leaf = qn.split("::")[-1]
+        if leaf and leaf not in seen and leaf not in _PRIMITIVE_TYPES:
+            seen.add(leaf)
+            result.append(leaf)
+
     return result
 
 
 def _classify_ownership(source_code: str) -> list[str]:
-    """Infer ownership / lifecycle notes from a type's source code."""
+    """Infer ownership / lifecycle notes from a type's source code.
+
+    Detects Rule of Five compliance, move semantics, swap idiom,
+    C++20 non-owning views, concepts, and coroutine types.
+    """
     hints: list[str] = []
 
-    # Deleted copy constructor / copy-assignment operator → non-copyable
-    if re.search(r'=\s*delete', source_code):
+    # --- Rule of Five analysis ---
+    has_dtor = bool(re.search(r'~\w+\s*\(', source_code))
+    has_copy_ctor = bool(re.search(r'\w+\s*\(\s*const\s+\w+\s*&\s*[),]', source_code))
+    has_copy_assign = bool(re.search(r'operator\s*=\s*\(\s*const\s+\w+\s*&', source_code))
+    has_move_ctor = bool(re.search(r'\w+\s*\(\s*\w+\s*&&\s*[),]', source_code))
+    has_move_assign = bool(re.search(r'operator\s*=\s*\(\s*\w+\s*&&', source_code))
+    has_deleted = bool(re.search(r'=\s*delete', source_code))
+
+    r5_count = sum([has_dtor, has_copy_ctor, has_copy_assign, has_move_ctor, has_move_assign])
+
+    if has_deleted:
         if re.search(r'\b(operator\s*=|\w+\s*\(\s*const\s+\w+\s*&)', source_code):
             hints.append("non-copyable (copy constructor or assignment deleted)")
         else:
             hints.append("has explicitly deleted special member(s)")
 
-    # Exclusive ownership
+    if r5_count >= 5:
+        hints.append("Rule of Five compliant (all five special members defined)")
+    elif r5_count >= 3:
+        hints.append(f"Rule of Five partially implemented ({r5_count}/5 special members)")
+
+    if has_move_ctor or has_move_assign:
+        hints.append("supports move semantics")
+
+    # Swap idiom.
+    if re.search(r'\bswap\s*\(', source_code):
+        hints.append("implements swap idiom")
+
+    # Exclusive ownership.
     if re.search(r'\bstd::unique_ptr\b', source_code):
         hints.append("owns exclusive resource via std::unique_ptr — not copyable by default")
 
-    # Shared ownership
+    # Shared ownership.
     if re.search(r'\bstd::shared_ptr\b', source_code):
         hints.append("shares ownership via std::shared_ptr")
 
-    # Polymorphic base
+    # Polymorphic base.
     if re.search(r'\bvirtual\b', source_code):
         hints.append("polymorphic (has virtual method(s)); prefer pointer/reference semantics")
 
-    # Explicit destructor — likely manages a resource
-    if re.search(r'~\w+\s*\(', source_code):
-        hints.append("manages resources (explicit destructor defined)")
+    # Explicit destructor without move (resource managed manually).
+    if has_dtor and not has_move_ctor and not has_move_assign:
+        hints.append("manages resources (explicit destructor, no move support)")
+
+    # C++20: Non-owning views.
+    if re.search(r'\bstd::span\b', source_code):
+        hints.append("uses std::span (non-owning contiguous view)")
+    if re.search(r'\bstd::string_view\b', source_code):
+        hints.append("uses std::string_view (non-owning string reference)")
+
+    # C++20: Concepts and constraints.
+    if re.search(r'\brequires\b', source_code):
+        hints.append("C++20 constrained (uses requires clause)")
+    if re.search(r'\bconcept\b', source_code):
+        hints.append("defines or uses C++20 concept")
+
+    # C++20: Coroutines.
+    if re.search(r'\bco_await\b|\bco_yield\b|\bco_return\b', source_code):
+        hints.append("C++20 coroutine type (uses co_await/co_yield/co_return)")
 
     return hints if hints else ["standard value semantics (copyable and movable)"]
 
@@ -677,7 +748,6 @@ def _collect_type_bundle(
     """Recursively resolve *seed_type_names* and all their base classes.
 
     Returns ``{type_name: {source_code, bases, ownership_hints}}``.
-    Only types present in *type_definitions* are included.
     """
     name_to_meta: dict[str, dict] = {}
     for t in types_meta:
@@ -697,7 +767,7 @@ def _collect_type_bundle(
 
         source_code = type_definitions.get(type_name)
         if source_code is None:
-            continue  # Not a known custom type in this file.
+            continue
 
         meta = name_to_meta.get(type_name, {})
         bases = [str(b) for b in (meta.get("bases") or [])]
@@ -709,21 +779,32 @@ def _collect_type_bundle(
             "ownership_hints": ownership_hints,
         }
 
-        # Queue base classes for recursive resolution.
         queue.extend(b for b in bases if b not in visited)
 
     return bundle
 
 
-def _format_type_bundle(bundle: dict[str, dict]) -> str:
-    """Render the type bundle as a structured, LLM-readable section."""
+def _format_type_bundle(
+    bundle: dict[str, dict],
+    header_paths: dict[str, str] | None = None,
+) -> str:
+    """Render the type bundle as a structured, LLM-readable section.
+
+    When *header_paths* is supplied, each type entry includes the relative
+    file path where the type was defined.
+    """
     if not bundle:
         return ""
+
+    header_paths = header_paths or {}
 
     lines: list[str] = ["=== TYPE BUNDLE (memory layout & ownership model) ==="]
     for type_name in sorted(bundle):
         info = bundle[type_name]
         lines.append(f"\n--- Type: {type_name} ---")
+        hpath = header_paths.get(type_name, "")
+        if hpath:
+            lines.append(f"Header Path: {hpath}")
         bases = info.get("bases") or []
         if bases:
             lines.append(f"Inherits from: {', '.join(bases)}")
@@ -735,24 +816,200 @@ def _format_type_bundle(bundle: dict[str, dict]) -> str:
     return "\n".join(lines)
 
 
+# ===================================================================
+# Global cross-file type resolution cache (incremental + threaded)
+# ===================================================================
+
+class _GlobalProjectMapCache:
+    """Lazily scans all C++ source / header files under ALLOWED_ROOT.
+
+    Features:
+    - **Incremental indexing** — tracks ``mtime`` per file and only re-parses
+      files that changed since the last scan.
+    - **Background build** — ``build_in_background()`` spawns a daemon thread
+      so the first tool call need not block for large codebases.
+    - **Header-path tracking** — records which file each type was defined in
+      so ``get_context_for_function`` can report it in the Type Bundle.
+    - **``_IGNORED_DIRS`` filtering** — skips node_modules, build, etc.
+    """
+
+    _instance: "_GlobalProjectMapCache | None" = None
+    _lock: threading.Lock = threading.Lock()
+
+    def __init__(self) -> None:
+        self._type_definitions: dict[str, str] = {}
+        self._types_meta: list[dict] = []
+        self._file_mtimes: dict[str, float] = {}
+        self._type_to_file: dict[str, str] = {}
+        self._include_graph: dict[str, list[str]] = {}
+        self._built: bool = False
+        self._building: bool = False
+
+    @classmethod
+    def get(cls) -> "_GlobalProjectMapCache":
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = cls()
+        return cls._instance
+
+    # --- Incremental helpers ------------------------------------------------
+
+    def _should_reindex_file(self, filepath: str) -> bool:
+        try:
+            current_mtime = os.path.getmtime(filepath)
+        except OSError:
+            return False
+        return self._file_mtimes.get(filepath) != current_mtime
+
+    def _index_file(self, parser: "CppParser", filepath: str) -> None:
+        try:
+            pm = parser.parse_file(filepath, workspace_root=ALLOWED_ROOT)
+        except Exception:
+            return
+
+        try:
+            self._file_mtimes[filepath] = os.path.getmtime(filepath)
+        except OSError:
+            pass
+
+        # Evict stale entries belonging to this file.
+        stale_names = [n for n, f in self._type_to_file.items() if f == filepath]
+        for n in stale_names:
+            self._type_definitions.pop(n, None)
+            self._type_to_file.pop(n, None)
+        self._types_meta = [
+            t for t in self._types_meta
+            if self._type_to_file.get(str(t.get("name", ""))) != filepath
+        ]
+
+        # Insert fresh data.
+        for name, src in (pm.get("type_definitions") or {}).items():
+            self._type_definitions[name] = src
+            self._type_to_file[name] = filepath
+        self._types_meta.extend(pm.get("types") or [])
+
+        # Track the include graph for this file.
+        headers: list[str] = pm.get("headers") or []
+        self._include_graph[filepath] = headers
+
+    # --- Build methods ------------------------------------------------------
+
+    def _build(self) -> None:
+        if self._building:
+            return
+        self._building = True
+        try:
+            if not _PARSER_AVAILABLE:
+                self._built = True
+                return
+
+            parser = CppParser()
+            extensions = ("*.cpp", "*.cc", "*.cxx", "*.h", "*.hpp", "*.hxx")
+            for ext in extensions:
+                pattern = os.path.join(ALLOWED_ROOT, "**", ext)
+                for filepath in glob.glob(pattern, recursive=True):
+                    if _path_has_ignored_component(filepath):
+                        continue
+                    if not self._built or self._should_reindex_file(filepath):
+                        self._index_file(parser, filepath)
+            self._built = True
+        finally:
+            self._building = False
+
+    def build_in_background(self) -> threading.Thread:
+        """Launch a daemon thread that builds the cache without blocking."""
+        thread = threading.Thread(target=self._build, daemon=True)
+        thread.start()
+        return thread
+
+    def ensure_built(self) -> None:
+        if not self._built:
+            self._build()
+
+    # --- Query methods ------------------------------------------------------
+
+    def lookup_types(
+        self, type_names: list[str],
+    ) -> tuple[dict[str, str], list[dict]]:
+        """Return (type_definitions, types_meta) for the requested names."""
+        self.ensure_built()
+        matched_defs = {
+            n: self._type_definitions[n]
+            for n in type_names
+            if n in self._type_definitions
+        }
+        name_set = set(type_names)
+        matched_meta = [
+            t for t in self._types_meta
+            if str(t.get("name", "")) in name_set
+        ]
+        return matched_defs, matched_meta
+
+    def get_header_path(self, type_name: str) -> str:
+        """Return the workspace-relative path where *type_name* is defined."""
+        self.ensure_built()
+        filepath = self._type_to_file.get(type_name, "")
+        if filepath:
+            return os.path.relpath(filepath, ALLOWED_ROOT)
+        return ""
+
+    def get_include_graph_for_file(self, filepath: str) -> dict[str, str | None]:
+        """Return ``{include_directive: resolved_path | None}`` for *filepath*."""
+        self.ensure_built()
+        raw_headers = self._include_graph.get(filepath, [])
+        result: dict[str, str | None] = {}
+        file_dir = os.path.dirname(filepath)
+        for hdr in raw_headers:
+            match = re.search(r'#\s*include\s*([<"].*[>"])', hdr)
+            if not match:
+                continue
+            header_ref = match.group(1).strip()
+            resolved = self._resolve_header(header_ref, file_dir)
+            result[hdr.strip()] = resolved
+        return result
+
+    def _resolve_header(self, header_ref: str, file_dir: str) -> str | None:
+        """Try to resolve a header ref like ``"foo.h"`` or ``<bar.hpp>`` to a real path."""
+        if header_ref.startswith('"') and header_ref.endswith('"'):
+            bare = header_ref.strip('"')
+            candidate = os.path.normpath(os.path.join(file_dir, bare))
+            if os.path.isfile(candidate):
+                return os.path.relpath(candidate, ALLOWED_ROOT)
+            candidate = os.path.normpath(os.path.join(ALLOWED_ROOT, bare))
+            if os.path.isfile(candidate):
+                return os.path.relpath(candidate, ALLOWED_ROOT)
+        elif header_ref.startswith('<') and header_ref.endswith('>'):
+            bare = header_ref.strip('<>')
+            candidate = os.path.normpath(os.path.join(ALLOWED_ROOT, bare))
+            if os.path.isfile(candidate):
+                return os.path.relpath(candidate, ALLOWED_ROOT)
+        return None
+
+    def invalidate(self) -> None:
+        """Force a full rescan on next access."""
+        with self._lock:
+            self._type_definitions.clear()
+            self._types_meta.clear()
+            self._file_mtimes.clear()
+            self._type_to_file.clear()
+            self._include_graph.clear()
+            self._built = False
+
+
+# ===================================================================
+# MCP tools — semantic / contextual
+# ===================================================================
+
 @mcp_server.tool()
 def get_context_for_function(file_path: str, function_fqn: str) -> str:
-    """
-    Return a rich modernization context bundle for a single C++ function.
+    """Return a rich modernisation context bundle for a single C++ function.
 
-    The bundle contains four sections:
-
-    1. **Function context** — full signature and body of the requested function.
-    2. **Called function signatures** — signatures of every internally called function
-       so the LLM respects existing contracts.
-    3. **Type Bundle** — definitions of every custom struct/class used in the
-       function's parameters or return type, resolved recursively through the
-       class hierarchy (base classes are included too), each annotated with
-       ownership and lifecycle notes (non-copyable, polymorphic, etc.).
-    4. **Required headers** — ``#include`` directives inferred for this function.
-
-    This context is designed to let an LLM modernize the function safely and
-    produce immediately compilable C++ without misunderstanding ownership.
+    The JSON result contains:
+    1. **function_context** — signature, body, parameters.
+    2. **called_signatures** — signatures of internally called functions.
+    3. **type_bundle** — definitions + ownership hints + *header_path* for
+       every custom type used in the function (resolved cross-file).
+    4. **required_headers** — inferred ``#include`` directives.
     """
     _tool_log(
         "get_context_for_function",
@@ -760,61 +1017,86 @@ def get_context_for_function(file_path: str, function_fqn: str) -> str:
     )
 
     if not _PARSER_AVAILABLE:
-        return (
-            "ERROR: CppParser is unavailable. "
-            "Ensure 'tree-sitter-cpp' is installed in the active virtual environment."
+        return _make_result(
+            "error",
+            message="CppParser is unavailable. Ensure 'tree-sitter-cpp' is installed.",
         )
 
     if not function_fqn or not function_fqn.strip():
-        return "ERROR: function_fqn must be a non-empty fully-qualified function name."
+        return _make_result("error", message="function_fqn must be a non-empty fully-qualified function name.")
 
     try:
         absolute_path = _ensure_within_allowed_root(file_path)
     except ValueError as sandbox_error:
-        return f"ERROR: {sandbox_error}"
+        return _make_result("error", message=str(sandbox_error))
 
     if not os.path.isfile(absolute_path):
-        return f"ERROR: File not found or not a regular file: {absolute_path}"
+        return _make_result("error", message=f"File not found or not a regular file: {absolute_path}")
 
     try:
         parser = CppParser()
-        project_map = parser.parse_file(absolute_path)
+        project_map = parser.parse_file(absolute_path, workspace_root=ALLOWED_ROOT)
     except Exception as exc:
-        return f"ERROR: Failed to parse C++ file: {exc!r}"
+        return _make_result("error", message=f"Failed to parse C++ file: {exc!r}")
 
     functions: dict = project_map.get("functions") or {}
     if not isinstance(functions, dict) or function_fqn not in functions:
         available = sorted(functions.keys()) if isinstance(functions, dict) else []
-        return (
-            f"ERROR: Function '{{function_fqn}}' not found in {os.path.basename(absolute_path)}.\n"
-            f"Available FQNs: {available}"
-        ).replace("{{function_fqn}}", function_fqn)
+        return _make_result(
+            "error",
+            message=f"Function '{function_fqn}' not found in {os.path.basename(absolute_path)}.",
+            available_fqns=available,
+        )
 
     try:
         base_context = parser.get_context_for_function(function_fqn)
     except Exception as exc:
-        return f"ERROR: Context extraction failed: {exc!r}"
+        return _make_result("error", message=f"Context extraction failed: {exc!r}")
 
     fn_meta = functions[function_fqn]
     signature = str(fn_meta.get("signature") or "")
     body = str(base_context.get("body") or "")
     called_signatures: dict = base_context.get("called_function_signatures") or {}
 
-    # Collect seed type names from structured parameters + full signature text.
+    # Collect seed type names from parameters + signature + body.
     parameters: list = fn_meta.get("parameters") or []
     param_type_text = " ".join(str(p.get("type") or "") for p in parameters)
-    seed_candidates = _extract_candidate_type_names(param_type_text + " " + signature)
+    seed_candidates = _extract_candidate_type_names(
+        param_type_text + " " + signature + " " + body
+    )
 
     type_definitions: dict = project_map.get("type_definitions") or {}
     types_meta: list = project_map.get("types") or []
 
-    # Only keep candidates that are recognized custom types in this translation unit.
     seed_types = [t for t in seed_candidates if t in type_definitions]
-    type_bundle = _collect_type_bundle(seed_types, type_definitions, types_meta)
 
-    # --- Format output sections ---
+    # Cross-file resolution: look up types not found locally.
+    unresolved = [t for t in seed_candidates if t not in type_definitions]
+    if unresolved:
+        global_cache = _GlobalProjectMapCache.get()
+        global_defs, global_meta = global_cache.lookup_types(unresolved)
+        merged_defs = {**global_defs, **type_definitions}
+        local_names = {str(t.get("name", "")) for t in types_meta}
+        merged_meta = types_meta + [
+            m for m in global_meta if str(m.get("name", "")) not in local_names
+        ]
+        seed_types.extend(t for t in unresolved if t in global_defs)
+    else:
+        merged_defs = type_definitions
+        merged_meta = types_meta
+
+    type_bundle = _collect_type_bundle(seed_types, merged_defs, merged_meta)
+
+    # Build header_path map for every type in the bundle.
+    global_cache = _GlobalProjectMapCache.get()
+    header_paths: dict[str, str] = {}
+    for type_name in type_bundle:
+        hp = global_cache.get_header_path(type_name)
+        if hp:
+            header_paths[type_name] = hp
+
+    # --- Format human-readable output sections ---
     sections: list[str] = []
-
     sections.append(f"=== FUNCTION CONTEXT: {function_fqn} ===")
     sections.append(f"\nSignature:\n{signature}")
     sections.append(f"\nBody:\n{body}")
@@ -824,7 +1106,7 @@ def get_context_for_function(file_path: str, function_fqn: str) -> str:
         for callee_fqn, callee_sig in sorted(called_signatures.items()):
             sections.append(f"  {callee_fqn}:\n    {callee_sig}")
 
-    type_bundle_text = _format_type_bundle(type_bundle)
+    type_bundle_text = _format_type_bundle(type_bundle, header_paths=header_paths)
     if type_bundle_text:
         sections.append("\n" + type_bundle_text)
 
@@ -832,8 +1114,222 @@ def get_context_for_function(file_path: str, function_fqn: str) -> str:
     if include_reqs:
         sections.append(f"\n=== REQUIRED HEADERS ===\n{', '.join(include_reqs)}")
 
-    return "\n".join(sections)
+    context_text = "\n".join(sections)
+
+    return _make_result(
+        "success",
+        context=context_text,
+        function_fqn=function_fqn,
+        header_paths=header_paths,
+        required_headers=include_reqs,
+    )
 
 
-if __name__ == "__main__":  # This line checks whether this file is being run directly as a script rather than being imported as a module.
-    mcp_server.run()  # This line starts the MCP server event loop, so the AI client can connect and call the read_code and run_compiler tools.
+@mcp_server.tool()
+def get_include_graph(file_path: str) -> str:
+    """Return the ``#include`` dependency graph for a C++ source/header file.
+
+    The result maps each ``#include`` directive to its resolved workspace-
+    relative path (or ``null`` if the header could not be located).  This
+    helps the LLM understand and manage header dependencies.
+    """
+    _tool_log("get_include_graph", f"file_path='{file_path}'")
+
+    if not _PARSER_AVAILABLE:
+        return _make_result(
+            "error",
+            message="CppParser is unavailable. Ensure 'tree-sitter-cpp' is installed.",
+        )
+
+    try:
+        absolute_path = _ensure_within_allowed_root(file_path)
+    except ValueError as sandbox_error:
+        return _make_result("error", message=str(sandbox_error))
+
+    if not os.path.isfile(absolute_path):
+        return _make_result("error", message=f"File not found: {absolute_path}")
+
+    # Ensure the global cache is built so header resolution can use it.
+    global_cache = _GlobalProjectMapCache.get()
+    global_cache.ensure_built()
+
+    graph = global_cache.get_include_graph_for_file(absolute_path)
+
+    # If the file was not yet indexed (e.g. just created), parse it ad-hoc.
+    if not graph:
+        try:
+            parser = CppParser()
+            pm = parser.parse_file(absolute_path, workspace_root=ALLOWED_ROOT)
+            headers = pm.get("headers") or []
+            file_dir = os.path.dirname(absolute_path)
+            graph = {}
+            for hdr in headers:
+                match = re.search(r'#\s*include\s*([<"].*[>"])', hdr)
+                if match:
+                    ref = match.group(1).strip()
+                    graph[hdr.strip()] = global_cache._resolve_header(ref, file_dir)
+        except Exception as exc:
+            return _make_result("error", message=f"Failed to parse file: {exc!r}")
+
+    return _make_result(
+        "success",
+        file_path=os.path.relpath(absolute_path, ALLOWED_ROOT),
+        include_graph=graph,
+    )
+
+
+@mcp_server.tool()
+def add_header_to_file(file_path: str, header_name: str) -> str:
+    """Add an ``#include`` directive to a C++ file if not already present.
+
+    The header is inserted immediately after the last existing ``#include``
+    line.  If no includes exist, the directive is prepended at the top.
+    """
+    _tool_log("add_header_to_file", f"file_path='{file_path}', header_name='{header_name}'")
+
+    if not header_name or not header_name.strip():
+        return _make_result("error", message="header_name must be a non-empty string.")
+
+    try:
+        absolute_path = _ensure_within_allowed_root(file_path)
+    except ValueError as sandbox_error:
+        return _make_result("error", message=str(sandbox_error))
+
+    if not os.path.isfile(absolute_path):
+        return _make_result("error", message=f"File not found or not a regular file: {absolute_path}")
+
+    header_name = header_name.strip()
+    if not (header_name.startswith("<") or header_name.startswith('"')):
+        header_name = f"<{header_name}>"
+    include_directive = f"#include {header_name}"
+
+    try:
+        with open(absolute_path, "r", encoding="utf-8") as fh:
+            lines = fh.readlines()
+    except Exception as exc:
+        return _make_result("error", message=f"Could not read file: {exc!r}")
+
+    for line in lines:
+        if line.strip() == include_directive:
+            return _make_result(
+                "success",
+                message=f"{include_directive} already exists in {os.path.basename(absolute_path)}.",
+                already_present=True,
+            )
+
+    last_include_idx = -1
+    for idx, line in enumerate(lines):
+        if line.lstrip().startswith("#include"):
+            last_include_idx = idx
+
+    if last_include_idx >= 0:
+        lines.insert(last_include_idx + 1, include_directive + "\n")
+    else:
+        lines.insert(0, include_directive + "\n")
+
+    try:
+        with open(absolute_path, "w", encoding="utf-8") as fh:
+            fh.writelines(lines)
+    except Exception as exc:
+        return _make_result("error", message=f"Could not write file: {exc!r}")
+
+    return _make_result(
+        "success",
+        message=f"Added '{include_directive}' to {os.path.basename(absolute_path)}.",
+        already_present=False,
+    )
+
+
+@mcp_server.tool()
+def get_compilation_errors(
+    command: str, working_directory: Optional[str] = None,
+) -> str:
+    """Run a compiler command and return a JSON object with structured errors.
+
+    Each entry has the shape ``{file, line, error_message}``.
+    On success (exit code 0) the ``errors`` list is empty.
+    """
+    _tool_log(
+        "get_compilation_errors",
+        f"command='{command}', working_directory='{working_directory or '.'}'",
+    )
+
+    try:
+        command_parts = shlex.split(command)
+    except ValueError as error:
+        return _make_result(
+            "error",
+            errors=[{"file": "<command>", "line": 0, "error_message": f"Bad command string: {error}"}],
+        )
+
+    # Compiler whitelist applies here too.
+    rejection = _validate_compiler_binary(command_parts)
+    if rejection is not None:
+        return _make_result(
+            "error",
+            errors=[{"file": "<whitelist>", "line": 0, "error_message": rejection}],
+        )
+
+    cwd_resolved: str | None = None
+    if working_directory is not None:
+        try:
+            cwd_resolved = _ensure_within_allowed_root(working_directory)
+        except ValueError as sandbox_error:
+            return _make_result(
+                "error",
+                errors=[{"file": "<sandbox>", "line": 0, "error_message": str(sandbox_error)}],
+            )
+        if not os.path.isdir(cwd_resolved):
+            return _make_result(
+                "error",
+                errors=[{"file": "<cwd>", "line": 0, "error_message": f"Directory not found: {cwd_resolved}"}],
+            )
+
+    try:
+        proc = subprocess.run(
+            command_parts,
+            cwd=cwd_resolved,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return _make_result(
+            "error",
+            errors=[{"file": "<compiler>", "line": 0, "error_message": "Compiler not found on PATH."}],
+        )
+    except Exception as exc:
+        return _make_result(
+            "error",
+            errors=[{"file": "<runtime>", "line": 0, "error_message": repr(exc)}],
+        )
+
+    if proc.returncode == 0:
+        return _make_result("success", errors=[], exit_code=0)
+
+    # Parse gcc/clang style diagnostics.
+    error_pattern = re.compile(
+        r'^(?P<file>[^:\s]+):(?P<line>\d+):\d*:?\s*(?:error|fatal error):\s*(?P<msg>.+)$',
+        re.MULTILINE,
+    )
+
+    combined = (proc.stdout or "") + "\n" + (proc.stderr or "")
+    errors: list[dict] = []
+    seen: set[tuple[str, int, str]] = set()
+    for m in error_pattern.finditer(combined):
+        entry = (m.group("file"), int(m.group("line")), m.group("msg").strip())
+        if entry not in seen:
+            seen.add(entry)
+            errors.append({"file": entry[0], "line": entry[1], "error_message": entry[2]})
+
+    if not errors:
+        errors.append({
+            "file": "<unknown>",
+            "line": 0,
+            "error_message": (proc.stderr or proc.stdout or "compilation failed with no output").strip()[:2000],
+        })
+
+    return _make_result("error", errors=errors, exit_code=proc.returncode)
+
+
+if __name__ == "__main__":
+    mcp_server.run()

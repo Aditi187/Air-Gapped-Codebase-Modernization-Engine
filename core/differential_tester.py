@@ -18,6 +18,11 @@ _SANITIZER_COMPILE_FLAGS: list[str] = [
     "-fno-omit-frame-pointer",
 ]
 
+
+def _sanitizers_available() -> bool:
+    """Return False on Windows/MinGW where ASan/UBSan libs are typically missing."""
+    return platform.system() != "Windows"
+
 _SANITIZER_ERROR_PATTERN = re.compile(
     r"(?:AddressSanitizer|UndefinedBehaviorSanitizer|LeakSanitizer|ERROR:\s*(?:address|leak|undefined))",
     re.IGNORECASE,
@@ -105,6 +110,10 @@ def compile_cpp_source(
 ) -> dict:
     compiler = resolve_gpp_exe(gpp_exe)
     _verify_compiler(compiler)
+
+    # Auto-disable sanitizers on Windows/MinGW (libs not available).
+    if enable_sanitizers and not _sanitizers_available():
+        enable_sanitizers = False
 
     start_time = time.time()
 
@@ -194,6 +203,10 @@ def _compile_and_run_cpp(
     _verify_compiler(gpp_exe)
 
     exe_path = os.path.join(tmp_dir, exe_name)
+
+    # Auto-disable sanitizers on Windows/MinGW (libs not available).
+    if enable_sanitizers and not _sanitizers_available():
+        enable_sanitizers = False
 
     compile_start = time.time()
     compile_cmd = [gpp_exe, "-std=c++20", "-Wall", source_path, "-o", exe_path]

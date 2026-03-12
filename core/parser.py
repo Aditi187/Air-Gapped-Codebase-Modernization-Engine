@@ -58,6 +58,7 @@ class CppParser:
     def __init__(self) -> None:
         self._parser = self._create_cpp_parser()
         self._last_project_map: Optional[ProjectMap] = None
+        self._workspace_root: Optional[Path] = None
 
     @staticmethod
     def _create_cpp_parser() -> Parser:
@@ -86,12 +87,23 @@ class CppParser:
 
         return parser
 
-    def parse_file(self, file_path: str | Path) -> ProjectMap:
-        """Parse a C++ source file into a Janus-style ProjectMap."""
+    def parse_file(
+        self,
+        file_path: str | Path,
+        workspace_root: str | Path | None = None,
+    ) -> ProjectMap:
+        """Parse a C++ source file into a Janus-style ProjectMap.
+
+        If *workspace_root* is given it is stored on the instance so that
+        downstream helpers can use it to resolve ``#include`` paths to
+        project-local headers.
+        """
 
         path = Path(file_path)
         if not path.is_file():
             raise FileNotFoundError(f"C++ file not found: {path}")
+        if workspace_root is not None:
+            self._workspace_root = Path(workspace_root)
         return self.parse_string(path.read_text(encoding="utf-8"))
 
     def parse_string(self, source_text: str) -> ProjectMap:

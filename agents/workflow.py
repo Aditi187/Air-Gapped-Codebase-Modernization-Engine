@@ -79,9 +79,30 @@ def _build_callers_map(dependency_map: dict[str, list[str]]) -> dict[str, list[s
     return callers_map
 
 
+# Regex to match DeepSeek special tokens like <｜begin▁of▁sentence｜> that leak
+# into generated code.  Handles both fullwidth (U+FF5C ｜) and ASCII pipe (|).
+_DEEPSEEK_SPECIAL_TOKEN_RE = re.compile(r"<[｜|][^>]{1,40}[｜|]>")
+
+
 def _clean_model_code_block(text: str) -> str:
-    cleaned = re.sub(r"```(?:[^\n]*)\n?", "", text)
-    return cleaned.strip()
+    """Extract code from the model's response, stripping markdown fences and prose.
+
+    If the response contains a fenced code block (```), only the content inside
+    the *first* such block is returned.  This prevents explanatory text that the
+    model sometimes emits before or after the code from polluting the source.
+    """
+    # Try to extract the first fenced code block.
+    fence_match = re.search(r"```(?:\w*)\n(.*?)```", text, re.DOTALL)
+    if fence_match:
+        cleaned = fence_match.group(1).strip()
+    else:
+        # Fallback: strip any stray triple-backtick lines.
+        cleaned = re.sub(r"```(?:[^\n]*)\n?", "", text)
+        cleaned = cleaned.strip()
+    # Strip DeepSeek special tokens (e.g. <｜begin▁of▁sentence｜>) that the
+    # model sometimes injects into its output.
+    cleaned = _DEEPSEEK_SPECIAL_TOKEN_RE.sub("", cleaned)
+    return cleaned
 
 
 def _extract_error_line_numbers(compiler_text: str) -> list[int]:
@@ -526,6 +547,14 @@ def pruner_node(state: ModernizationState) -> ModernizationState:
     pruned_code = _prune_dead_includes(pruned_code, sorted(orphans_to_prune))
 
     state["code"] = pruned_code  # This line updates the state with the pruned source code so the modernizer works on a smaller, focused input.
+
+    # Remove pruned functions from the modernization order so the modernizer
+    # does not attempt to re-add them.
+    existing_order = state.get("modernization_order") or []
+    state["modernization_order"] = [
+        name for name in existing_order if name not in orphans_to_prune
+    ]
+
     print(f"✂️  Pruning {len(spans_to_remove)} orphan function(s): {', '.join(sorted(orphans_to_prune))}")  # This print summarizes what was removed in a visually distinct way.
 
     return state  # This return passes the updated state object along to the next node in the workflow.
@@ -657,6 +686,15 @@ def modernizer_node(state: ModernizationState) -> ModernizationState:
 
             # The model is asked to return only code, but we still defensively strip out any markdown triple backticks so only raw code remains.
             cleaned_function = _clean_model_code_block(raw_text)
+
+            # The model often returns the whole file instead of just the
+            # target function.  Try to extract only the target function
+            # from the cleaned output to avoid duplicate definitions.
+            extracted = _extract_function_text_from_code(
+                cleaned_function, current_function_name
+            )
+            if extracted:
+                cleaned_function = extracted
 
             target_start = current_function_info.get("start_byte")
             target_end = current_function_info.get("end_byte")
@@ -834,17 +872,40 @@ def tester_node(state: ModernizationState) -> ModernizationState:
 
 def surgical_router(state: ModernizationState) -> str:
     """
-    Router function: Decides whether to retry modernization or proceed to END
+    Router function: Decides whether to retry modernization or proceed to END.
+
+    After a function is successfully modernized (compilation + parity), checks
+    whether more functions remain in the modernization order.  If so, routes
+    back to the modernizer node to process the next function; otherwise ends.
     """
     verification_success = bool(state["verification_result"].get("success"))
     parity_passed = bool(state.get("is_parity_passed", False))
     attempt_count = int(state.get("attempt_count", 0))
 
     if parity_passed and verification_success:
-        print("\n🏁 Routing to END (SUCCESS: compilation + parity)")
+        # Check if more functions remain to be modernized.
+        current_index = int(state.get("current_function_index", 0))
+        modernization_order = state.get("modernization_order") or []
+        if current_index < len(modernization_order):
+            print(f"\n🔄 Routing back to MODERNIZER (next function: {modernization_order[current_index]})")
+            # Reset attempt counter and error log for the next function.
+            state["attempt_count"] = 0
+            state["error_log"] = ""
+            return "modernizer"
+        print("\n🏁 Routing to END (SUCCESS: all functions modernized)")
         return "end"
 
     if attempt_count >= 5:
+        # Current function exhausted retries — skip it and try the next one.
+        current_index = int(state.get("current_function_index", 0))
+        modernization_order = state.get("modernization_order") or []
+        state["current_function_index"] = current_index + 1
+        if current_index + 1 < len(modernization_order):
+            state["partial_success"] = True
+            state["attempt_count"] = 0
+            state["error_log"] = ""
+            print(f"\n🔄 Skipping failed function, routing to MODERNIZER (next: {modernization_order[current_index + 1]})")
+            return "modernizer"
         state["partial_success"] = True
         print("\n🏁 Routing to END (PARTIAL_SUCCESS after max attempts)")
         return "end"
