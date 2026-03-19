@@ -18,7 +18,7 @@ from core.ast_modernizer import ASTModernizationDetector
 from core.graph import DependencyGraph
 from core.openai_bridge import CPP_MODERNIZATION_SYSTEM_PROMPT
 from core.differential_tester import compile_cpp_source, run_differential_test
-from core.inspect_parser import score_cpp23_compliance
+from core.inspect_parser import score_cpp17_compliance
 from core.rule_modernizer import apply_modernization_rules
 from core.similarity import code_similarity_ratio
 from core.rag import get_global_rag
@@ -27,9 +27,8 @@ from core.rag import get_global_rag
 _FENCE_RE = re.compile(r"```(?:\w*)\n(.*?)```", re.DOTALL)
 _SIMILARITY_THRESHOLD = 0.70
 _MIN_CHANGE_LINES = 2
-_MODERN_SKIP_THRESHOLD_PERCENT = 70
+_MODERN_SKIP_THRESHOLD_PERCENT = 85
 _MAX_FUNCTION_CHARS = 3000
-_RULE_ONLY_COMPLEXITY_THRESHOLD = 3
 
 
 def _env_float(name: str, default: float) -> float:
@@ -623,7 +622,7 @@ class FunctionModernizer:
 
     def modernize_function(self, file_path: str, unique_fqn: str) -> None:
         max_attempts = 3
-        min_modernization_score = 20
+        min_modernization_score = 35
         compiler_feedback = ""
         self.stats["functions_analyzed"] += 1
 
@@ -676,16 +675,10 @@ class FunctionModernizer:
             self.stats["legacy_constructs_detected"] += detected_count
             patterns_text = self._format_patterns(patterns, detected_types)
 
-            function_score = score_cpp23_compliance(function_body)
+            function_score = score_cpp17_compliance(function_body)
             if self._safe_percent(function_score) > _MODERN_SKIP_THRESHOLD_PERCENT:
                 _log("SKIP", "Function already modern. Skipping.")
                 return
-
-            raw_complexity = function_meta.get("complexity", 0)
-            try:
-                complexity = int(raw_complexity)
-            except (TypeError, ValueError):
-                complexity = 0
 
             _rule_preview, applied_rules = self._apply_rules_to_function_body(
                 function_body,
@@ -700,13 +693,6 @@ class FunctionModernizer:
 
             # Skip LLM if no legacy constructs and no rules applied — nothing to modernize.
             if detected_count == 0 and not applied_rules:
-                return
-
-            if complexity <= (_RULE_ONLY_COMPLEXITY_THRESHOLD + 1):
-                _log(
-                    "SKIP",
-                    f"Rule-only path for '{unique_fqn}' (complexity={complexity}).",
-                )
                 return
 
             function_hash = str(
@@ -866,7 +852,7 @@ class FunctionModernizer:
                     )
                     continue
                 modernization_score = int(
-                    self._safe_percent(score_cpp23_compliance(modernized_function))
+                    self._safe_percent(score_cpp17_compliance(modernized_function))
                 )
                 code_changed = not is_similar_code(
                     function_body,
@@ -886,7 +872,7 @@ class FunctionModernizer:
                     )
                     continue
                 if modernization_score < _MODERN_RETRY_THRESHOLD_PERCENT and code_changed:
-                    enhanced = score_cpp23_compliance(modernized_function)
+                    enhanced = score_cpp17_compliance(modernized_function)
                     low_metric_feedback: list[str] = []
                     metrics_obj = enhanced.get("metrics")
                     metrics = metrics_obj if isinstance(metrics_obj, dict) else {}

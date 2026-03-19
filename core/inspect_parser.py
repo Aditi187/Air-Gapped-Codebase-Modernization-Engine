@@ -16,7 +16,7 @@ _LOG = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class ComplianceRule:
-	"""Single weighted compliance rule used by score_cpp23_compliance.
+	"""Single weighted compliance rule used by score_cpp17_compliance.
 
 	Each rule contributes up to weight points based on positive and negative
 	pattern matches on masked source text.
@@ -42,39 +42,32 @@ _RULES: List[ComplianceRule] = [
 		recommendation="Prefer std::expected/std::optional over manual return codes.",
 	),
 	ComplianceRule(
-		id="format_print",
+		id="string_view",
 		weight=10,
-		positive_pattern=_regex(r"\bstd::(print|println|format)\b"),
-		negative_pattern=_regex(r"\b(printf|std::cout|std::cerr)\b"),
-		recommendation="Prefer std::print/std::format for output formatting.",
+		positive_pattern=_regex(r"\bstd::string_view\b"),
+		negative_pattern=_regex(r"\b(const\s+std::string\s*&|const\s+char\s*\*)\b"),
+		recommendation="Use std::string_view for non-owning string parameters and views.",
 	),
-	ComplianceRule(
-		id="span_mdspan",
-		weight=10,
-		positive_pattern=_regex(r"\bstd::(span|mdspan)\b"),
-		negative_pattern=_regex(r"\b(char\s*\*|void\s*\*)\b"),
-		recommendation="Use std::span/std::mdspan for buffer handling.",
-	),
-	ComplianceRule(
-		id="ranges_views_pipelines",
-		weight=10,
-		positive_pattern=_regex(r"\bstd::(ranges|views)::"),
-		negative_pattern=_regex(r"\bstd::(sort|transform|find|for_each|copy|count|any_of|all_of|none_of)\s*\("),
-		recommendation="Prefer std::ranges/views pipelines where algorithm composition is needed.",
-	),
+# 	ComplianceRule(
+# 		id="span_mdspan",
+# 		weight=10,
+# 		positive_pattern=_regex(r"\bstd::(span|mdspan)\b"),
+# 		negative_pattern=_regex(r"\b(char\s*\*|void\s*\*)\b"),
+# 		recommendation="Use std::span/std::mdspan for buffer handling.",
+# 	),
+# 	ComplianceRule(
+# 		id="ranges_views_pipelines",
+# 		weight=10,
+# 		positive_pattern=_regex(r"\bstd::(ranges|views)::"),
+# 		negative_pattern=_regex(r"\bstd::(sort|transform|find|for_each|copy|count|any_of|all_of|none_of)\s*\("),
+# 		recommendation="Prefer std::ranges/views pipelines where algorithm composition is needed.",
+# 	),
 	ComplianceRule(
 		id="unique_ptr_stack",
 		weight=12,
 		positive_pattern=_regex(r"\bstd::unique_ptr\b|\bstd::make_unique\b"),
 		negative_pattern=_regex(r"\b(new|delete)\b"),
 		recommendation="Prefer std::unique_ptr and stack allocation over raw new/delete.",
-	),
-	ComplianceRule(
-		id="string_view",
-		weight=10,
-		positive_pattern=_regex(r"\bstd::string_view\b"),
-		negative_pattern=_regex(r"\b(const\s+std::string\s*&|const\s+char\s*\*)\b"),
-		recommendation="Use std::string_view for non-owning string parameters and views.",
 	),
 	ComplianceRule(
 		id="structured_bindings",
@@ -190,11 +183,20 @@ _SCORE_CACHE: OrderedDict[str, Dict[str, object]] = OrderedDict()
 _SCORE_CACHE_LOCK = threading.Lock()
 _CACHE_MAX_SIZE = 100
 
-_DEFAULT_TARGET_STD = "c++23"
+_DEFAULT_TARGET_STD = "c++17"
 _MODERN_HEADERS_BY_STD: Dict[str, set[str]] = {
 	"c++17": {"<memory>", "<optional>", "<variant>", "<filesystem>", "<string_view>"},
 	"c++20": {"<memory>", "<span>", "<ranges>", "<optional>", "<expected>", "<string_view>"},
 	"c++23": {"<memory>", "<span>", "<print>", "<ranges>", "<optional>", "<expected>"},
+}
+
+_RULE_IDS_NOT_ALLOWED_FOR_CPP17 = {
+	"consteval_constinit",
+	"concepts_requires",
+	"coroutines",
+	"three_way_comparison",
+	"source_location",
+	"constant_evaluated",
 }
 
 _SCORE_RULE_WEIGHT_DEFAULT = 0.6
@@ -204,9 +206,21 @@ _RE_INCLUDE = re.compile(r"#\s*include\s*([<\"][^>\"]+[>\"])")
 _RE_RAW_POINTER = re.compile(
 	r"\b(?:const\s+)?(?:[A-Za-z_]\w*(?:::[A-Za-z_]\w*)*(?:\s*<[^;\n{}()]*>)?\s+)+\*+\s*[A-Za-z_]\w*\b"
 )
+_RE_CHAR_POINTER = re.compile(r"\bchar\s*\*\s*[A-Za-z_]\w*\b")
+_RE_MALLOC = re.compile(r"\bmalloc\s*\(")
+_RE_FREE = re.compile(r"\bfree\s*\(")
 _RE_SMART_POINTER = re.compile(r"\bstd::(?:unique_ptr|shared_ptr|weak_ptr|make_unique|make_shared)\b")
+_RE_STD_STRING = re.compile(r"\bstd::string\b")
+_RE_STD_VECTOR = re.compile(r"\bstd::vector\b")
+_RE_STD_ARRAY = re.compile(r"\bstd::array\b")
+_RE_STD_OPTIONAL = re.compile(r"\bstd::optional\b")
 _RE_PRINTF = re.compile(r"\bprintf\s*\(")
+_RE_FPRINTF = re.compile(r"\bfprintf\s*\(")
+_RE_STD_COUT = re.compile(r"\bstd::cout\b")
+_RE_STD_CERR = re.compile(r"\bstd::cerr\b")
 _RE_STD_PRINT = re.compile(r"\bstd::(?:print|println)\s*\(")
+_RE_STD_OPTIONAL = re.compile(r"\bstd::optional\b")
+_RE_ERROR_CODE_RETURN = re.compile(r"\breturn\s+(?:0|1|-1|\d+)\s*;")
 _RE_MANUAL_LOOP = re.compile(r"\b(?:for|while)\s*\(")
 _RE_RANGE_LOOP = re.compile(
 	r"for\s*\(\s*(?:const\s+)?auto(?:\s*[&]{1,2})?\s+[A-Za-z_][A-Za-z0-9_]*\s*:\s*[^\)]+\)"
@@ -287,11 +301,12 @@ def _load_rules_from_config(path: str) -> Optional[List[ComplianceRule]]:
 	return rules
 
 
-def _get_rules() -> List[ComplianceRule]:
+def _get_rules(target_std: str = _DEFAULT_TARGET_STD) -> List[ComplianceRule]:
 	config_rules = _load_rules_from_config(_rules_config_path())
-	if config_rules:
-		return config_rules
-	return list(_DEFAULT_RULES)
+	rules = config_rules if config_rules else list(_DEFAULT_RULES)
+	if _normalize_target_std(target_std) == "c++17":
+		return [rule for rule in rules if rule.id not in _RULE_IDS_NOT_ALLOWED_FOR_CPP17]
+	return rules
 
 
 def _validate_rule_weights(rules: List[ComplianceRule]) -> int:
@@ -535,11 +550,22 @@ def _extract_modernization_metrics(
 	modern_headers = _MODERN_HEADERS_BY_STD.get(std_key, _MODERN_HEADERS_BY_STD[_DEFAULT_TARGET_STD])
 
 	raw_pointer_count = len(_RE_RAW_POINTER.findall(masked_code))
+	char_pointer_count = len(_RE_CHAR_POINTER.findall(masked_code))
+	malloc_count = len(_RE_MALLOC.findall(masked_code))
+	free_count = len(_RE_FREE.findall(masked_code))
 	smart_pointer_count = len(_RE_SMART_POINTER.findall(masked_code))
+	std_string_count = len(_RE_STD_STRING.findall(masked_code))
+	std_vector_count = len(_RE_STD_VECTOR.findall(masked_code))
+	std_array_count = len(_RE_STD_ARRAY.findall(masked_code))
+	std_optional_count = len(_RE_STD_OPTIONAL.findall(masked_code))
 	printf_count = len(_RE_PRINTF.findall(masked_code))
+	fprintf_count = len(_RE_FPRINTF.findall(masked_code))
+	std_cout_count = len(_RE_STD_COUT.findall(masked_code))
+	std_cerr_count = len(_RE_STD_CERR.findall(masked_code))
 	std_print_count = len(_RE_STD_PRINT.findall(masked_code))
 	manual_loop_count = len(_RE_MANUAL_LOOP.findall(masked_code))
 	range_loop_count = len(_RE_RANGE_LOOP.findall(masked_code))
+	error_code_count = len(_RE_ERROR_CODE_RETURN.findall(masked_code))
 
 	# Supplement a few high-value metrics with AST signals when available.
 	ast_signals = _ast_assisted_signals(source_code)
@@ -551,7 +577,7 @@ def _extract_modernization_metrics(
 
 	metric_breakdown: List[Dict[str, object]] = []
 	metric_score = 0
-	metric_max = 100
+	metric_max = 200  # Increased to accommodate I/O + error handling metrics
 
 	if smart_pointer_count > 0 or raw_pointer_count == 0:
 		pointer_score = 20
@@ -571,12 +597,142 @@ def _extract_modernization_metrics(
 		}
 	)
 
-	if printf_count == 0 and std_print_count > 0:
-		print_score = 15
-	elif printf_count == 0:
-		print_score = 10
+	c_memory_penalty_hits = malloc_count + free_count + char_pointer_count
+	if c_memory_penalty_hits == 0:
+		c_memory_score = 20
+	elif c_memory_penalty_hits == 1:
+		c_memory_score = 12
+	elif c_memory_penalty_hits == 2:
+		c_memory_score = 6
 	else:
-		print_score = 2
+		c_memory_score = 0
+	metric_score += c_memory_score
+	metric_breakdown.append(
+		{
+			"id": "c_memory_penalty",
+			"score": c_memory_score,
+			"max_score": 20,
+			"malloc": malloc_count,
+			"free": free_count,
+			"char_pointer": char_pointer_count,
+			"feedback": "Penalized for malloc/free/char* usage. Prefer std::string, std::vector, and smart-pointer ownership with RAII.",
+		}
+	)
+
+	# POSITIVE METRIC: Reward std::string usage for proper string modernization
+	if std_string_count > 0:
+		string_score = min(15, std_string_count * 5)  # Up to 15 points for using std::string
+	else:
+		string_score = 0
+	metric_score += string_score
+	metric_breakdown.append(
+		{
+			"id": "string_modernization",
+			"score": string_score,
+			"max_score": 15,
+			"std_string_count": std_string_count,
+			"feedback": "Excellent: std::string usage detected. String handling is now exception-safe and memory-managed automatically.",
+		}
+	)
+
+	# POSITIVE METRIC: Reward RAII containers (std::vector, std::array, std::optional)
+	raii_container_count = std_vector_count + std_array_count + std_optional_count
+	if raii_container_count > 0:
+		container_score = min(20, raii_container_count * 4)  # Up to 20 points for containers
+	else:
+		container_score = 0
+	metric_score += container_score
+	metric_breakdown.append(
+		{
+			"id": "container_modernization",
+			"score": container_score,
+			"max_score": 20,
+			"std_vector": std_vector_count,
+			"std_array": std_array_count,
+			"std_optional": std_optional_count,
+			"feedback": "Excellent: Modern C++ containers detected. Memory management is automated and exception-safe with RAII semantics.",
+		}
+	)
+
+	# POSITIVE METRIC: Reward smart pointer usage
+	if smart_pointer_count > 0:
+		smart_ptr_bonus = min(15, smart_pointer_count * 3)  # Up to 15 points for smart pointers
+	else:
+		smart_ptr_bonus = 0
+	metric_score += smart_ptr_bonus
+	metric_breakdown.append(
+		{
+			"id": "smart_pointer_modernization",
+			"score": smart_ptr_bonus,
+			"max_score": 15,
+			"smart_pointers": smart_pointer_count,
+			"feedback": "Excellent: Smart pointers detected. Ownership is now explicit and exception-safe.",
+		}
+	)
+
+	# POSITIVE METRIC: Reward std::cout/std::cerr usage (replace printf)
+	stdio_replacement_count = std_cout_count + std_cerr_count + std_print_count
+	if stdio_replacement_count > 0:
+		stdio_score = min(20, stdio_replacement_count * 5)  # Up to 20 points for modern I/O
+	else:
+		stdio_score = 0
+	metric_score += stdio_score
+	metric_breakdown.append(
+		{
+			"id": "io_modernization",
+			"score": stdio_score,
+			"max_score": 20,
+			"std_cout": std_cout_count,
+			"std_cerr": std_cerr_count,
+			"std_print": std_print_count,
+			"feedback": "Excellent: std::cout/std::cerr detected. I/O is now type-safe and exception-aware.",
+		}
+	)
+
+	# POSITIVE METRIC: Reward std::optional usage (replace error codes)
+	if std_optional_count > 0:
+		optional_score = min(25, std_optional_count * 6)  # Up to 25 points for std::optional
+	else:
+		optional_score = 0
+	metric_score += optional_score
+	metric_breakdown.append(
+		{
+			"id": "optional_error_handling",
+			"score": optional_score,
+			"max_score": 25,
+			"std_optional": std_optional_count,
+			"error_code_returns": error_code_count,
+			"feedback": "Excellent: std::optional detected for null-safe error handling. This replaces error codes with type-safe semantics.",
+		}
+	)
+
+	# PENALTY METRIC: Penalize printf/fprintf usage (should use std::cout instead)
+	stdio_c_count = printf_count + fprintf_count
+	if stdio_c_count > 0:
+		stdio_penalty = -min(15, stdio_c_count * 5)  # Penalty for C-style I/O
+	else:
+		stdio_penalty = 0
+	metric_score += stdio_penalty
+	metric_breakdown.append(
+		{
+			"id": "printf_penalty",
+			"score": stdio_penalty,
+			"max_score": 0,
+			"printf": printf_count,
+			"fprintf": fprintf_count,
+			"feedback": "Penalized: C-style printf/fprintf detected. Use std::cout or std::cerr for type-safe I/O instead.",
+		}
+	)
+
+	if std_key == "c++17":
+		print_score = 15 if printf_count == 0 else 2
+	else:
+		if printf_count == 0 and std_print_count > 0:
+			print_score = 15
+		elif printf_count == 0:
+			print_score = 10
+		else:
+			print_score = 2
 	metric_score += print_score
 	metric_breakdown.append(
 		{
@@ -585,7 +741,11 @@ def _extract_modernization_metrics(
 			"max_score": 15,
 			"printf": printf_count,
 			"std_print": std_print_count,
-			"feedback": "Prefer std::print/std::println over printf where available.",
+			"feedback": (
+				"Prefer iostreams or type-safe formatting wrappers over printf in C++17."
+				if std_key == "c++17"
+				else "Prefer std::print/std::println over printf where available."
+			),
 		}
 	)
 
@@ -605,7 +765,7 @@ def _extract_modernization_metrics(
 			"max_score": 15,
 			"manual_loops": manual_loop_count,
 			"range_loops": range_loop_count,
-			"feedback": "Prefer range-based loops and std::ranges algorithms when safe.",
+			"feedback": "Prefer range-based loops and standard algorithms when safe.",
 		}
 	)
 
@@ -637,17 +797,32 @@ def _extract_modernization_metrics(
 			"max_score": 30,
 			"present": present_headers,
 			"target_std": std_key,
-			"feedback": "Include modern headers such as <memory>, <span>, <ranges>, and <print> when required.",
+			"feedback": (
+				"Include modern C++17 headers such as <memory>, <optional>, <variant>, and <string_view> when required."
+				if std_key == "c++17"
+				else "Include modern headers such as <memory>, <span>, <ranges>, and <print> when required."
+			),
 		}
 	)
 
 	return {
 		"raw_pointer_count": raw_pointer_count,
+		"char_pointer_count": char_pointer_count,
+		"malloc_count": malloc_count,
+		"free_count": free_count,
 		"smart_pointer_count": smart_pointer_count,
+		"std_string_count": std_string_count,
+		"std_vector_count": std_vector_count,
+		"std_array_count": std_array_count,
+		"std_optional_count": std_optional_count,
 		"printf_count": printf_count,
+		"fprintf_count": fprintf_count,
+		"std_cout_count": std_cout_count,
+		"std_cerr_count": std_cerr_count,
 		"std_print_count": std_print_count,
 		"manual_loop_count": manual_loop_count,
 		"range_loop_count": range_loop_count,
+		"error_code_count": error_code_count,
 		"cyclomatic_complexity": cyclomatic_complexity,
 		"modern_headers_present": present_headers,
 		"metric_score": metric_score,
@@ -658,9 +833,9 @@ def _extract_modernization_metrics(
 	}
 
 
-def score_cpp23_compliance(source_code: str, target_std: str = _DEFAULT_TARGET_STD) -> Dict[str, object]:
-	"""Score C++ source code compliance using weighted heuristic rules.
-
+def score_cpp17_compliance(source_code: str, target_std: str = _DEFAULT_TARGET_STD) -> Dict[str, object]:
+	"""Score C++ source code compliance using weighted heuristic rules for C++17 target.
+	
 	Limitations:
 	- Pattern matching is regex-based and not AST/lexer perfect.
 	- Comments and string literals are masked heuristically to reduce false
@@ -683,7 +858,7 @@ def score_cpp23_compliance(source_code: str, target_std: str = _DEFAULT_TARGET_S
 	if cached is not None:
 		return cached
 
-	rules = _get_rules()
+	rules = _get_rules(target_std=std_key)
 	code_for_matching = _mask_non_code(source_code)
 	total_weight = _validate_rule_weights(rules)
 	score = 0

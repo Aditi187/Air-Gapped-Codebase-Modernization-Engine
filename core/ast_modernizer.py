@@ -45,6 +45,10 @@ class PatternName(Enum):
     MEMCPY_USAGE = "memcpy_usage"
     AUTO_PTR_USAGE = "auto_ptr_usage"
     THROW_SPEC = "throw_spec"
+    RAW_ARRAY = "raw_array"
+    C_STRING = "c_string"
+    POSIX_FILE = "posix_file"
+    MANUAL_INIT = "manual_init"
 
     def __str__(self) -> str:
         return self.value
@@ -320,7 +324,18 @@ class ASTModernizationDetector:
                 if node_type == ASTNodeType.POINTER_DECLARATOR.value:
                     self._detect_pointers(node, source_bytes, patterns, locations)
 
-            if not self.config.is_pattern_enabled(PatternName.C_STYLE_CAST):
+            if self.config.is_pattern_enabled(PatternName.RAW_ARRAY):
+                if node.node_type == "array_declarator" or node.node_type == "pointer_declarator":
+                    if self._is_raw_array_decl(node, source_bytes):
+                        patterns[str(PatternName.RAW_ARRAY)] += 1
+                        self._record_location(locations, PatternName.RAW_ARRAY, node)
+
+            if self.config.is_pattern_enabled(PatternName.C_STRING):
+                if node.node_type == "string_literal" and node.ancestor_of_type("pointer_declarator"):
+                    patterns[str(PatternName.C_STRING)] += 1
+                    self._record_location(locations, PatternName.C_STRING, node)
+
+            if self.config.is_pattern_enabled(PatternName.C_STYLE_CAST):
                 pass
             elif node_type in {
                 ASTNodeType.CAST_EXPRESSION.value,
@@ -340,7 +355,7 @@ class ASTModernizationDetector:
                 PatternName.MALLOC_USAGE
             ) or self.config.is_pattern_enabled(PatternName.FREE_USAGE) or self.config.is_pattern_enabled(
                 PatternName.MEMCPY_USAGE
-            ):
+            ) or self.config.is_pattern_enabled(PatternName.POSIX_FILE):
                 if node_type == ASTNodeType.CALL_EXPRESSION.value:
                     self._detect_function_calls(node, source_bytes, patterns, locations)
 
@@ -363,6 +378,11 @@ class ASTModernizationDetector:
                 if "std::auto_ptr" in node_text or "auto_ptr" in node_text:
                     patterns[str(PatternName.AUTO_PTR_USAGE)] += 1
                     self._record_location(locations, PatternName.AUTO_PTR_USAGE, node)
+
+            if self.config.is_pattern_enabled(PatternName.MANUAL_INIT):
+                if node_type == ASTNodeType.DECLARATION.value and self._is_manual_init(node, source_bytes):
+                    patterns[str(PatternName.MANUAL_INIT)] += 1
+                    self._record_location(locations, PatternName.MANUAL_INIT, node)
 
             if not self.config.is_pattern_enabled(PatternName.THROW_SPEC):
                 pass
@@ -495,7 +515,7 @@ class ASTModernizationDetector:
         locations: Dict[str, List[Dict[str, int]]],
     ) -> None:
         """
-        Detect function calls to printf, malloc, free, and memcpy.
+        Detect function calls to printf, malloc, free, memcpy, posix file APIs.
 
         Uses exact function name matching (not substring).
 
@@ -522,6 +542,12 @@ class ASTModernizationDetector:
         if self.config.is_pattern_enabled(PatternName.MEMCPY_USAGE) and func_name == "memcpy":
             patterns[str(PatternName.MEMCPY_USAGE)] += 1
             self._record_location(locations, PatternName.MEMCPY_USAGE, node)
+
+        if self.config.is_pattern_enabled(PatternName.POSIX_FILE):
+            posix_files = {"fopen", "fclose", "fread", "fwrite", "fscanf", "fprintf"}
+            if func_name in posix_files:
+                patterns[str(PatternName.POSIX_FILE)] += 1
+                self._record_location(locations, PatternName.POSIX_FILE, node)
 
     def _detect_throw_spec(
         self,
@@ -649,6 +675,24 @@ class ASTModernizationDetector:
         ) is not None
 
         return cond_ok and update_ok
+
+    def _is_raw_array_decl(self, node: ASTNode, source_bytes: bytes) -> bool:
+        """Detect raw C-style arrays (not std::array)."""
+        text = node.get_text(source_bytes).lower()
+        return "[]" in text and "std::array" not in text
+
+    def _is_c_string_init(self, node: ASTNode, source_bytes: bytes) -> bool:
+        """Detect char* = \"literal\"; patterns."""
+        parent = node.parent
+        if parent is None or parent.node_type != ASTNodeType.DECLARATION.value:
+            return False
+        text = parent.get_text(source_bytes)
+        return bool(re.search(r"char\s*\*\s*[A-Za-z_]\w*\s*=\s*\"", text, re.IGNORECASE))
+
+    def _is_manual_init(self, node: ASTNode, source_bytes: bytes) -> bool:
+        """Detect non-constexpr manual value initialization (e.g. int x = compute();)."""
+        text = node.get_text(source_bytes).lower()
+        return "=" in text and "constexpr" not in text and not re.search(r"\b\d+\b", text)
 
     def _compute_function_hash(self, source_bytes: bytes) -> str:
         """

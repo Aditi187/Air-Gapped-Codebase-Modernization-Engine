@@ -132,13 +132,24 @@ class LangfuseTracker:
         self._default_trace_name = (default_trace_name or os.environ.get("LANGFUSE_TRACE_NAME", "").strip() or _DEFAULT_TRACE_NAME)
         self._client: Any = None
         self._flush_registered = False
+        self._auto_flush = str(os.environ.get("LANGFUSE_AUTO_FLUSH", "1")).strip().lower() in {"1", "true", "yes", "on"}
 
         public_key = os.environ.get("LANGFUSE_PUBLIC_KEY", "").strip()
         secret_key = os.environ.get("LANGFUSE_SECRET_KEY", "").strip()
         host = os.environ.get("LANGFUSE_HOST", "").strip()
 
         if not public_key or not secret_key or not host:
-            self._logger.info("Langfuse disabled: missing LANGFUSE_PUBLIC_KEY/LANGFUSE_SECRET_KEY/LANGFUSE_HOST.")
+            missing: list[str] = []
+            if not public_key:
+                missing.append("LANGFUSE_PUBLIC_KEY")
+            if not secret_key:
+                missing.append("LANGFUSE_SECRET_KEY")
+            if not host:
+                missing.append("LANGFUSE_HOST")
+            self._logger.info(
+                "Langfuse disabled: missing required env var(s): %s",
+                ", ".join(missing),
+            )
             return
 
         if Langfuse is None:
@@ -164,6 +175,10 @@ class LangfuseTracker:
 
     def enabled(self) -> bool:
         return self._client is not None
+
+    def _flush_after_write(self) -> None:
+        if self._auto_flush:
+            self.flush()
 
     def create_trace(self, name: str | None = None, input_payload: Any = None) -> Any:
         if not self.enabled():
@@ -232,6 +247,7 @@ class LangfuseTracker:
         try:
             if hasattr(span, "end"):
                 span.end(**kwargs)
+                self._flush_after_write()
                 return
             self._logger.warning("Span object has no end() method; skipping finalize.")
         except Exception as exc:
@@ -305,9 +321,11 @@ class LangfuseTracker:
         try:
             if hasattr(generation, "end"):
                 _invoke_with_keyword_fallback(generation.end, kwargs)
+                self._flush_after_write()
                 return
             if hasattr(generation, "update"):
                 _invoke_with_keyword_fallback(generation.update, kwargs)
+                self._flush_after_write()
                 return
             self._logger.warning("Generation object has no end()/update(); skipping finalize.")
         except Exception as exc:
@@ -322,6 +340,7 @@ class LangfuseTracker:
         try:
             if hasattr(trace, "update"):
                 trace.update(output=payload, metadata={"status": "Error"})
+                self._flush_after_write()
                 return
             self._logger.warning("Trace object does not support update(); cannot mark error for message=%s", message)
         except Exception as exc:

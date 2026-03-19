@@ -44,7 +44,7 @@ from core.differential_tester import (
     compile_cpp_source,
 )
 from core.openai_bridge import CPP_MODERNIZATION_SYSTEM_PROMPT, OpenAIBridge
-from core.inspect_parser import score_cpp23_compliance
+from core.inspect_parser import score_cpp17_compliance
 from core.similarity import code_similarity_ratio
 from core.logger import get_logger
 
@@ -136,18 +136,83 @@ _MODEL_SYSTEM_PROMPT = "\n\n".join(
         "3) Rewrite only the requested function(s); do not edit unrelated code.",
         "4) Perform deep modernization inside target functions: RAII, std::unique_ptr, std::string, modern loops, nullptr, and safer ownership.",
         "4.1) Replace C-style ownership patterns when safe: malloc/free/new/delete -> smart pointers, std::string, std::vector, std::array, or stack objects.",
-        "4.2) Do not keep manual heap management unless required by external ABI or binary interface constraints visible in this file.",
-        "4.3) Prefer expressive modern signatures (const refs, string_view where appropriate, return-by-value with move semantics) when behavior remains equivalent.",
+        "4.2) ⚠️ CRITICAL: Do NOT wrap malloc() results in smart pointers. REMOVE malloc/free entirely. Replace with std::vector, std::string, std::unique_ptr with value semantics, or stack allocation.",
+        "4.2a) REJECT any solution using unique_ptr<T, decltype(&free)> around malloc. This is not modernization—it is wrapping garbage.",
+        "4.2b) If malloc was used for dynamic arrays: replace with std::vector<T>.",
+        "4.2c) If malloc was used for strings: replace with std::string.",
+        "4.2d) If malloc was used for single objects: use std::make_unique<T> or stack allocation.",
+        "4.3) Do not keep manual heap management unless required by external ABI or binary interface constraints visible in this file.",
+        "4.4) Prefer expressive modern signatures (const refs, string_view where appropriate, return-by-value with move semantics) when behavior remains equivalent.",
+        "4.5) STRONGLY PREFER std::cout/std::cerr over printf for C++17. This is a major modernization signal.",
+        "4.6) CRITICAL: Replace error codes (return int for status) with std::optional<T> or return nullptr patterns for cleaner, safer code.",
         "5) When compiler errors are provided, fix them and retain deep-modernized style.",
         "6) Return ONLY code (no prose, no markdown fences, no lists, no commentary).",
         "Output must compile as valid C++17 in the existing translation unit context.",
         "Few-shot examples:",
         "Example 1\nBefore:\nfor (int i = 0; i < v.size(); ++i) { sum += v[i]; }\nAfter:\nfor (const auto& item : v) { sum += item; }",
         "Example 2\nBefore:\nif (ptr == NULL) return -1;\nAfter:\nif (ptr == nullptr) return -1;",
-        "Example 3\nBefore:\nint* p = new int(1);\nuse(*p);\ndelete p;\nAfter:\nauto p = std::make_unique<int>(1);\nuse(*p);",
+        "Example 3\nBefore:\nchar* buf = (char*)malloc(256); strcpy(buf, data); printf(\\\"%s\\\", buf); free(buf);\nAfter:\nstd::string buf(data); std::cout << buf;",
+        "Example 4\nBefore:\nstruct Data* d = (struct Data*)malloc(sizeof(struct Data)); d->x = 42; use(d); free(d);\nAfter:\nauto d = std::make_unique<Data>(); d->x = 42; use(d.get());",
+        "Example 5\nBefore:\nprintf(\\\"Result: %d\\\\n\\\", value);\nAfter:\nstd::cout << \\\"Result: \\\" << value << \\\"\\\\n\\\";",
+        "Example 6\nBefore:\nint load_data(Data** out, int id) { if (id < 0) return -1; ... return 0; }\nAfter:\nstd::optional<std::unique_ptr<Data>> load_data(int id) { if (id < 0) return std::nullopt; ... return std::make_unique<Data>(...); }",
     ]
 )
-_MODERNIZER_NODE_SIMILARITY_GUARD = 0.90
+_GLOBAL_MODERNIZER_PROMPT = "\n\n".join(
+    [
+        "You are an ARCHITECT-LEVEL C++17 modernization engine.",
+        "Now perform FINAL GLOBAL REFACTORING - this is your last chance to reach modern C++17 standards.",
+        "The code has already been partially modernized function-by-function but likely still contains legacy C memory patterns.",
+        "Your GLOBAL mission:",
+        "1. Refactor the ENTIRE translation unit holistically for maximum C++17 compliance.",
+        "2. Eliminate ALL malloc/free/char* patterns—replace with std::vector, std::string, and std::unique_ptr.",
+        "3. Improve function signatures for safety and clarity (change params/returns as needed for RAII compliance).",
+        "4. Restructure ownership model so no manual memory management remains (zero malloc/free in output).",
+        "5. Replace printf/fprintf with std::cout/std::cerr/std::cout << ... wherever it appears.",
+        "6. Replace error-code return patterns (return -1, return 0) with std::optional<T> or nullopt-based patterns.",
+        "",
+        "You MAY (and SHOULD):",
+        "- Change function signatures if it improves RAII safety",
+        "- Replace error codes with std::optional<T> or return std::unique_ptr directly",
+        "- Replace raw pointers with std::unique_ptr, std::shared_ptr, std::vector, or std::string",
+        "- Replace all char* with std::string",
+        "- Remove malloc/free/new/delete entirely",
+        "- Simplify and restructure the ownership model",
+        "- Improve API design for modern C++ idioms",
+        "- Use smart pointers with proper semantics (DO NOT wrap malloc in unique_ptr)",
+        "- Replace printf/fprintf with iostream equivalents (std::cout, std::cerr, std::endl)",
+        "",
+        "⚠️ CRITICAL RULES (Violation = Failure):",
+        "- malloc( MUST NOT appear in output (0 occurrences required)",
+        "- free( MUST NOT appear in output (0 occurrences required)",
+        "- char* declarations MUST NOT appear in output for user strings (use std::string)",
+        "- printf( SHOULD NOT appear in output (use std::cout/std::cerr instead)",
+        "- Error code patterns should be REPLACED with std::optional or direct returns",
+        "- Do NOT use unique_ptr<T, decltype(&free)> as a workaround—that's wrapped garbage, not modernization",
+        "- Do NOT add new global functions or structs (only refactor existing)",
+        "- Preserve all observable behavior exactly (return codes, side effects, output)",
+        "- Must compile cleanly under C++17 (-std=c++17)",
+        "",
+        "Quality checkpoints for 80%+ score:",
+        "✓ All malloc/free removed and replaced with RAII",
+        "✓ All char* user buffers replaced with std::string",
+        "✓ All printf/fprintf replaced with std::cout/std::cerr",
+        "✓ Error codes replaced with std::optional or direct return patterns",
+        "✓ All function signatures use modern C++ (references, smart pointers, optional)",
+        "✓ Code is idiomatic C++17: no manual new/delete, no raw ownership patterns",
+        "✓ Compilation succeeds with -std=c++17",
+        "✓ Behavior is identical to original (all tests pass)",
+        "",
+        "Error handling pattern recommendation:",
+        "OLD: int load_record(Data** out, int id) { if (!id) return -1; ... return 0; } ... if (load_record(&rec, 42) == 0) { .... }",
+        "NEW: std::optional<std::unique_ptr<Data>> load_record(int id) { if (!id) return std::nullopt; ... return std::make_unique<Data>(...); } ... if (auto rec = load_record(42)) { ... }",
+        "",
+        "Output:",
+        "- ONLY final C++17 code (no explanation, no markdown, no lists, no commentary)",
+        "- Code must be ready to compile immediately",
+        "- Return complete file or affected functions",
+    ]
+)
+_MODERNIZER_NODE_SIMILARITY_GUARD = 0.82
 _MAX_MODERNIZER_FUNCTION_CHARS = 3000
 _MODEL_OUTPUT_ATTEMPTS = 3
 _WORKFLOW_ALLOW_SIGNATURE_REFACTOR = os.environ.get("WORKFLOW_ALLOW_SIGNATURE_REFACTOR", "1").strip().lower() in {
@@ -157,9 +222,9 @@ _WORKFLOW_ALLOW_SIGNATURE_REFACTOR = os.environ.get("WORKFLOW_ALLOW_SIGNATURE_RE
     "on",
 }
 try:
-    _MODEL_MIN_SCORE_DELTA = max(0, min(100, int(os.environ.get("WORKFLOW_MIN_SCORE_DELTA", "3").strip() or "3")))
+    _MODEL_MIN_SCORE_DELTA = max(0, min(100, int(os.environ.get("WORKFLOW_MIN_SCORE_DELTA", "8").strip() or "8")))
 except ValueError:
-    _MODEL_MIN_SCORE_DELTA = 3
+    _MODEL_MIN_SCORE_DELTA = 8
 
 
 def _read_bool_env(name: str, default: bool = False) -> bool:
@@ -194,7 +259,7 @@ def _read_bounded_float_env(name: str, default: float, minimum: float, maximum: 
 _WORKFLOW_BATCH_SIZE = _read_bounded_int_env("WORKFLOW_BATCH_SIZE", 1, 1, 5)
 _WORKFLOW_MAX_ATTEMPTS_PER_FUNCTION = _read_bounded_int_env("MAX_ATTEMPTS_PER_FUNCTION", 10, 1, 100)
 _WORKFLOW_STAGNANT_SCORE_LIMIT = _read_bounded_int_env("WORKFLOW_STAGNANT_SCORE_LIMIT", 10, 1, 100)
-_WORKFLOW_MIN_FINAL_SCORE = _read_bounded_int_env("WORKFLOW_MIN_FINAL_SCORE", 30, 0, 100)
+_WORKFLOW_MIN_FINAL_SCORE = _read_bounded_int_env("WORKFLOW_MIN_FINAL_SCORE", 55, 0, 100)
 
 
 def _workflow_use_llm() -> bool:
@@ -233,13 +298,17 @@ def _is_provider_failure_message(message: str) -> bool:
     )
 
 
-_STRICT_CPP23_MODE = (
+_STRICT_CPP17_MODE = (
+    _read_bool_env("WORKFLOW_STRICT_CPP17_MODE", False)
+    or _read_bool_env("CPP17_STRICT_MODE", False)
+    or
     _read_bool_env("WORKFLOW_STRICT_MODE", False)
     or _read_bool_env("CPP23_STRICT_MODE", False)
 )
-_STRICT_CPP23_TARGET_PERCENT = _read_bounded_int_env(
-    "CPP23_STRICT_TARGET_PERCENT",
-    70,
+_STRICT_CPP17_TARGET_DEFAULT = _read_bounded_int_env("CPP23_STRICT_TARGET_PERCENT", 70, 0, 100)
+_STRICT_CPP17_TARGET_PERCENT = _read_bounded_int_env(
+    "CPP17_STRICT_TARGET_PERCENT",
+    _STRICT_CPP17_TARGET_DEFAULT,
     0,
     100,
 )
@@ -521,7 +590,8 @@ def _batch_prompt_for_functions(
         "Return STRICT JSON only in this exact shape:",
         "{\"functions\":[{\"id\":\"<identifier>\",\"code\":\"<full_function_code>\"}]}",
         "Rules: one full function definition per id, no markdown fences, no prose.",
-        "Rules: minimal/surgical diffs only, no unrelated changes outside each target function.",
+        "Rules: deep C++17 modernization in each target function (RAII ownership, safe strings/containers, nullptr, and modern loops) while preserving observable behavior.",
+        "Rules: replacing manual memory management with C++17 RAII is preferred over minimal/no-op edits.",
         "Rules: when compiler feedback is present, fix only those errors with minimal edits.",
     ]
 
@@ -1152,8 +1222,8 @@ class ModernizationState(TypedDict):
     current_target_function: str  # This field stores the function being surgically modernized in the current iteration.
     source_file: str  # Path to the original source file; used to derive the output file path.
     output_file_path: str  # Explicit output path; when non-empty it overrides the auto-derived path.
-    legacy_findings: list[dict[str, Any]]  # Static-analysis tags for legacy C/C++ regions needing C++23 overhaul.
-    compliance_report: dict[str, Any]  # C++23 compliance score details for the current modernized candidate.
+    legacy_findings: list[dict[str, Any]]  # Static-analysis tags for legacy regions requiring deep C++17 modernization.
+    compliance_report: dict[str, Any]  # C++17 modernization score details for the current modernized candidate.
     functions_info: list[dict[str, Any]]  # Cached parser output for the current working code to avoid repeated full re-parsing.
     functions_index: dict[str, dict[str, Any]]  # Index of function metadata keyed by unique identifier (unique_fqn preferred).
     current_function_name: str  # Name of the function currently being modernized.
@@ -1166,6 +1236,7 @@ class ModernizationState(TypedDict):
     current_target_stable_key: str  # Stable signature-based key for the current target function.
     last_function_scores: dict[str, int]  # Last modernization score observed for each target function.
     function_stagnation_counts: dict[str, int]  # Consecutive attempts with unchanged score per function.
+    global_refactor_done: bool  # Whether the one-time global holistic modernization pass already ran.
 
 
 def _update_function_stagnation(state: ModernizationState, code_snapshot: str) -> None:
@@ -1189,7 +1260,7 @@ def _update_function_stagnation(state: ModernizationState, code_snapshot: str) -
     if not function_text:
         return
 
-    function_score = _safe_score_percent(score_cpp23_compliance(function_text))
+    function_score = _safe_score_percent(score_cpp17_compliance(function_text))
     last_scores = dict(state.get("last_function_scores") or {})
     stagnation_counts = dict(state.get("function_stagnation_counts") or {})
 
@@ -1534,7 +1605,7 @@ def modernizer_node(state: ModernizationState) -> ModernizationState:
 
         state["current_function_span"] = (start_byte, end_byte)
         function_source = source_bytes[start_byte:end_byte].decode("utf-8", errors="strict")
-        original_quality_score = _safe_score_percent(score_cpp23_compliance(function_source))
+        original_quality_score = _safe_score_percent(score_cpp17_compliance(function_source))
         if len(function_source) > _MAX_MODERNIZER_FUNCTION_CHARS:
             warning = (
                 f"Skipping large function '{current_function_identifier}' "
@@ -1823,6 +1894,97 @@ def modernizer_node(state: ModernizationState) -> ModernizationState:
     return state  # This return passes the updated state on to the verifier node.
 
 
+def global_modernizer_node(state: ModernizationState) -> ModernizationState:
+    """One-time holistic refactor pass across the entire file after per-function passes."""
+    logger.info("\n🌐 GLOBAL_MODERNIZER NODE")
+
+    source_to_improve = (
+        state.get("modernized_code")
+        or state.get("last_working_code")
+        or state.get("code")
+        or ""
+    )
+    if not source_to_improve.strip():
+        state["error_log"] = "Global modernizer skipped: empty source snapshot."
+        state["global_refactor_done"] = True
+        return state
+
+    llm_enabled = bool(state.get("use_llm", True))
+    llm_available = bool(state.get("llm_available", True))
+    if not llm_enabled or not llm_available:
+        state["error_log"] = (
+            "Global modernizer skipped: LLM unavailable or disabled "
+            f"(use_llm={llm_enabled}, llm_available={llm_available})."
+        )
+        state["global_refactor_done"] = True
+        return state
+
+    global_prompt = (
+        _GLOBAL_MODERNIZER_PROMPT
+        + "\n\nCurrent code:\n```cpp\n"
+        + source_to_improve
+        + "\n```"
+    )
+
+    try:
+        raw_text = call_model(_MODEL_SYSTEM_PROMPT, global_prompt)
+        cleaned_candidate = _clean_model_code_block(raw_text).strip()
+        if not cleaned_candidate:
+            state["error_log"] = "Global modernizer returned empty output."
+            state["global_refactor_done"] = True
+            return state
+
+        # CRITICAL VALIDATION: Reject outputs that still contain malloc/free patterns
+        if re.search(r"\bmalloc\s*\(", cleaned_candidate):
+            state["error_log"] = (
+                "❌ REJECTED: Global modernizer output still contains malloc(). "
+                "This violates the modernization mandate: malloc must be removed and replaced with RAII."
+            )
+            state["global_refactor_done"] = True
+            return state
+
+        if re.search(r"\bfree\s*\(", cleaned_candidate):
+            state["error_log"] = (
+                "❌ REJECTED: Global modernizer output still contains free(). "
+                "This violates the modernization mandate: free must be removed and replaced with RAII."
+            )
+            state["global_refactor_done"] = True
+            return state
+
+        # DETECTION: Warn if wrapped malloc pattern still present (unique_ptr with decltype(&free))
+        if re.search(r"unique_ptr\s*<.*?decltype\s*\(\s*&\s*free\s*\)", cleaned_candidate):
+            state["error_log"] = (
+                "⚠️  WARNING: Global modernizer output contains wrapped malloc pattern (unique_ptr with free deleter). "
+                "This is not true modernization. Continuing anyway, but this indicates insufficient refactoring."
+            )
+            logger.warning("Wrapped malloc pattern detected in global refactor output.")
+
+        compile_result = compile_cpp_source(cleaned_candidate)
+        if not bool(compile_result.get("success")):
+            state["error_log"] = (
+                "Global modernizer produced non-compiling code; keeping previous candidate.\n"
+                + str(
+                    compile_result.get("raw_stderr")
+                    or "\n".join(compile_result.get("errors") or [])
+                    or "unknown compile failure"
+                )
+            )
+            state["global_refactor_done"] = True
+            return state
+
+        state["modernized_code"] = cleaned_candidate
+        state["last_working_code"] = cleaned_candidate
+        state["error_log"] = ""
+        state["attempt_count"] = int(state.get("attempt_count", 0)) + 1
+        state["global_refactor_done"] = True
+        logger.info("✓ Global modernizer accepted: malloc/free removed, code compiles.")
+        return state
+    except Exception as exc:
+        state["error_log"] = f"Global modernizer failed: {exc!r}"
+        state["global_refactor_done"] = True
+        return state
+
+
 def verifier_node(state: ModernizationState) -> ModernizationState:
     """
     Node 3: Verifier - Validates modernized code via MCP compiler tool
@@ -1857,7 +2019,7 @@ def verifier_node(state: ModernizationState) -> ModernizationState:
         logger.info("✅ Verification PASSED")
         state["error_log"] = ""  # This line clears the error log because there are no compiler errors to feed back into the model.
         state["last_working_code"] = state["modernized_code"]
-        state["compliance_report"] = score_cpp23_compliance(state["modernized_code"])
+        state["compliance_report"] = score_cpp17_compliance(state["modernized_code"])
         compliance_raw = state["compliance_report"].get("percent", 0)
         try:
             compliance_percent = int(float(str(compliance_raw)))
@@ -2098,11 +2260,47 @@ def surgical_router(state: ModernizationState) -> str:
         current_index = int(state.get("current_function_index", 0))
         modernization_order = state.get("modernization_order") or []
         compliance_percent = _safe_score_percent(state.get("compliance_report") or {})
+        no_remaining_functions = current_index >= len(modernization_order)
+        global_refactor_done = bool(state.get("global_refactor_done", False))
 
+        # PRIORITY 1: Check if we should trigger global modernizer
+        # This takes precedence over per-function retries
+        if (
+            no_remaining_functions
+            and compliance_percent < _WORKFLOW_MIN_FINAL_SCORE
+            and not global_refactor_done
+        ):
+            logger.info(
+                "\n🌐 Routing to GLOBAL_MODERNIZER (final score %d%% < required %d%%)",
+                compliance_percent,
+                _WORKFLOW_MIN_FINAL_SCORE,
+            )
+            state["error_log"] = (
+                f"Final score {compliance_percent}% below required {_WORKFLOW_MIN_FINAL_SCORE}%. "
+                "Run one holistic global refactor pass."
+            )
+            return "global_modernizer"
+
+        if no_remaining_functions and compliance_percent < _WORKFLOW_MIN_FINAL_SCORE and global_refactor_done:
+            state["partial_success"] = True
+            logger.warning(
+                "Final score %d%% still below required %d%% after global refactor; finishing with PARTIAL_SUCCESS.",
+                compliance_percent,
+                _WORKFLOW_MIN_FINAL_SCORE,
+            )
+            logger.info("\n🏁 Routing to END (PARTIAL_SUCCESS after global refactor)")
+            return "end"
+
+        # PRIORITY 2: Per-function retries (only if score is not hitting global_modernizer threshold)
         if (
             current_index >= len(modernization_order)
             and modernization_order
             and compliance_percent < _WORKFLOW_MIN_FINAL_SCORE
+            and not (
+                no_remaining_functions
+                and compliance_percent < _WORKFLOW_MIN_FINAL_SCORE
+                and not global_refactor_done
+            )
         ):
             if attempt_count < _WORKFLOW_MAX_ATTEMPTS_PER_FUNCTION:
                 refreshed_functions = list(state.get("functions_info") or [])
@@ -2206,12 +2404,14 @@ def build_workflow():
     workflow.add_node("prune", pruner_node)
     workflow.add_node("analyze", analyzer_node)
     workflow.add_node("transform", modernizer_node)
+    workflow.add_node("global_modernizer", global_modernizer_node)
     workflow.add_node("verify", verify_node)
     
     # Define edges for the graph-first, self-healing pipeline
     workflow.add_edge("prune", "analyze")
     workflow.add_edge("analyze", "transform")
     workflow.add_edge("transform", "verify")
+    workflow.add_edge("global_modernizer", "verify")
     
     # Conditional edge from tester based on compilation and parity results
     workflow.add_conditional_edges(
@@ -2219,6 +2419,7 @@ def build_workflow():
         surgical_router,
         {
             "modernizer": "transform",
+            "global_modernizer": "global_modernizer",
             "end": END
         }
     )
@@ -2311,6 +2512,7 @@ def run_modernization_workflow(code: str, language: str = "c++17", source_file: 
         current_target_stable_key="",
         last_function_scores={},
         function_stagnation_counts={},
+        global_refactor_done=False,
     )
     
     # Build and run the workflow
@@ -2326,17 +2528,17 @@ def run_modernization_workflow(code: str, language: str = "c++17", source_file: 
     graph = build_workflow()
     final_state = graph.invoke(initial_state)
 
-    if _STRICT_CPP23_MODE:
+    if _STRICT_CPP17_MODE:
         compliance_percent = int(final_state.get("compliance_report", {}).get("percent", 0))
         strict_ok = (
             bool(final_state.get("verification_result", {}).get("success"))
             and bool(final_state.get("is_parity_passed", False))
-            and compliance_percent >= _STRICT_CPP23_TARGET_PERCENT
+            and compliance_percent >= _STRICT_CPP17_TARGET_PERCENT
         )
         if not strict_ok:
             strict_message = (
-                "STRICT MODE FAILURE: final output did not satisfy required C++23 compliance target "
-                f"({_STRICT_CPP23_TARGET_PERCENT}%). Final score: {compliance_percent}%."
+                "STRICT MODE FAILURE: final output did not satisfy required C++17 modernization target "
+                f"({_STRICT_CPP17_TARGET_PERCENT}%). Final score: {compliance_percent}%."
             )
             final_state["verification_result"] = {
                 "success": False,
@@ -2350,9 +2552,14 @@ def run_modernization_workflow(code: str, language: str = "c++17", source_file: 
             logger.error("❌ %s", strict_message)
         else:
             logger.info(
-                "✅ STRICT MODE PASSED: C++23 compliance %d%% >= %d%%",
-                compliance_percent, _STRICT_CPP23_TARGET_PERCENT
+                "✅ STRICT MODE PASSED: C++17 modernization score %d%% >= %d%%",
+                compliance_percent, _STRICT_CPP17_TARGET_PERCENT
             )
+
+    try:
+        _MODEL_BRIDGE.tracker.flush()
+    except Exception:
+        pass
 
     logger.info("\n" + "=" * 60)
     logger.info("📊 MODERNIZATION COMPLETE")

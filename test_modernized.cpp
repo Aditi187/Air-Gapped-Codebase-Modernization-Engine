@@ -1,50 +1,39 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+#include <algorithm>
+#include <iostream>
+#include <optional>
+#include <string>
+#include <string_view>
 
-// Global pointer - a nightmare for thread safety and modernization
-char* GLOBAL_LOG_BUFFER = NULL;
+std::string GLOBAL_LOG_BUFFER;
 
-typedef struct {
-    int id;
-    char* raw_data;
-    size_t len;
-} LegacyRecord;
-int load_record(LegacyRecord** out_rec, int id) {
-    if (out_rec == nullptr || id <= 0) return -1; // Error code
+struct LegacyRecord {
+    int id{};
+    std::string raw_data;
+    std::size_t len{};
+};
 
-    *out_rec = nullptr;
-    LegacyRecord* rec = static_cast<LegacyRecord*>(malloc(sizeof(LegacyRecord)));
-    if (rec == nullptr) return -1;
-
-    rec->id = id;
-
-    const char* dummy = "DEVICE_DATA_STREAM_0xCF";
-    rec->len = strlen(dummy);
-    rec->raw_data = static_cast<char*>(malloc(rec->len + 1));
-    if (rec->raw_data == nullptr) {
-        free(rec);
-        return -1;
+std::optional<LegacyRecord> load_record(int id) {
+    if (id <= 0) {
+        return std::nullopt;
     }
 
-    memcpy(rec->raw_data, dummy, rec->len + 1);
-    *out_rec = rec;
+    constexpr std::string_view kRawData{"DEVICE_DATA_STREAM_0xCF"};
 
-    return 0; // Success code
+    LegacyRecord record{};
+    record.id = id;
+    record.raw_data.assign(kRawData.begin(), kRawData.end());
+    record.len = record.raw_data.size();
+
+    return record;
 }
 
 void process_data() {
-    LegacyRecord* rec = nullptr;
-    // Pointer to pointer logic is a great test for std::expected and smart pointers
-    if (load_record(&rec, 42) == 0) {
-        printf("Processing Record %d: %s\n", rec->id, rec->raw_data);
-
-        // Manual cleanup often forgotten by lazy AI
-        free(rec->raw_data);
-        free(rec);
-    } else {
-        printf("Failed to load record.\n");
+    const auto rec = load_record(42);
+    if (rec.has_value()) {
+        std::cout << "Processing Record " << rec->id << ": " << rec->raw_data << "\n";
+        return;
     }
+    std::cout << "Failed to load record.\n";
 }
 
 int main() {

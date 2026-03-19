@@ -55,6 +55,16 @@ OPENAI_INTER_REQUEST_DELAY_SECONDS=1.5
 OPENAI_429_BASE_DELAY_SECONDS=60
 OPENAI_429_MAX_DELAY_SECONDS=900
 WORKFLOW_BATCH_SIZE=3
+WORKFLOW_MIN_FINAL_SCORE=55
+WORKFLOW_MIN_SCORE_DELTA=8
+WORKFLOW_STRICT_CPP17_MODE=1
+CPP17_STRICT_TARGET_PERCENT=70
+
+# Langfuse (optional but recommended)
+LANGFUSE_PUBLIC_KEY=...
+LANGFUSE_SECRET_KEY=...
+LANGFUSE_HOST=https://cloud.langfuse.com
+LANGFUSE_AUTO_FLUSH=1
 ```
 
 ## Run Workflow
@@ -75,6 +85,7 @@ python tools/mcp_server.py
 
 - If OpenAI health fails (for example quota/rate-limit), the workflow can continue in deterministic fallback mode.
 - LangFuse is optional but enabled when LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY, and LANGFUSE_HOST are set.
+- If traces do not appear immediately, keep LANGFUSE_AUTO_FLUSH=1 and verify the process log for any "Langfuse disabled: missing required env var(s)" message.
 
 ## Git Hygiene
 

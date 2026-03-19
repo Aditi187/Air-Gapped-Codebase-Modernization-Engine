@@ -431,7 +431,22 @@ class OpenAIBridge:
             with self._cache_lock:
                 cached_entry = self._response_cache.get(cache_key)
             if isinstance(cached_entry, dict) and cached_entry.get("v"):
-                return str(cached_entry["v"])
+                cached_text = str(cached_entry["v"])
+                trace = self._active_trace
+                generation = self.tracker.create_generation(
+                    trace=trace,
+                    name=f"{self.config.provider}-cache-hit",
+                    model=self.config.models[0] if self.config.models else "unknown-model",
+                    input_data=user_prompt,
+                    metadata={"provider": self.config.provider, "cache_hit": True},
+                )
+                self.tracker.finalize_generation(
+                    generation,
+                    output=cached_text,
+                    model=self.config.models[0] if self.config.models else "unknown-model",
+                    metadata={"cache_hit": True, "cache_version": self._cache_version},
+                )
+                return cached_text
 
         enforce_full_response = expects_large_code_response(prompt_for_request)
         effective_timeout = int(timeout_seconds or self.config.request_timeout_seconds)
