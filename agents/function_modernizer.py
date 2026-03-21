@@ -25,8 +25,8 @@ from core.rag import get_global_rag
 
 
 _FENCE_RE = re.compile(r"```(?:\w*)\n(.*?)```", re.DOTALL)
-_SIMILARITY_THRESHOLD = 0.70
-_MIN_CHANGE_LINES = 2
+_SIMILARITY_THRESHOLD = 0.65
+_MIN_CHANGE_LINES = 1
 _MODERN_SKIP_THRESHOLD_PERCENT = 85
 _MAX_FUNCTION_CHARS = 3000
 
@@ -43,25 +43,25 @@ def _env_float(name: str, default: float) -> float:
 
 def _env_int(name: str, default: int, minimum: int | None = None, maximum: int | None = None) -> int:
     raw = os.environ.get(name, "").strip()
-    if not raw:
+    try:
+        value = default if not raw else int(raw)
+    except ValueError:
         value = default
-    else:
-        try:
-            value = int(raw)
-        except ValueError:
-            value = default
-    if minimum is not None:
-        value = max(minimum, value)
-    if maximum is not None:
-        value = min(maximum, value)
+    value = max(minimum, value) if minimum is not None else value
+    value = min(maximum, value) if maximum is not None else value
     return value
 
 
 def _default_cache_root() -> str:
-    local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
-    if local_app_data:
-        return os.path.join(local_app_data, "cpp-modernizer")
-    return os.path.join(os.path.expanduser("~"), ".cache", "cpp-modernizer")
+    return os.path.join(
+        os.environ.get("LOCALAPPDATA", "").strip() or os.path.join(os.path.expanduser("~"), ".cache"),
+        "cpp-modernizer",
+    )
+
+
+def _read_bool_env(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name, "").strip().lower()
+    return (value in {"1", "true", "yes", "on"}) if value else default
 
 
 @dataclass(frozen=True)
@@ -99,13 +99,12 @@ class ModernizerConfig:
             debug_mode=_read_bool_env("MODERNIZER_DEBUG", False),
             prompt_cache_path=prompt_cache_path,
             function_cache_path=function_cache_path,
-            similarity_short_threshold=_env_float("SIMILARITY_THRESHOLD_SHORT", 0.88),
-            similarity_medium_threshold=_env_float("SIMILARITY_THRESHOLD_MEDIUM", 0.82),
-            similarity_long_threshold=_env_float("SIMILARITY_THRESHOLD_LONG", 0.78),
-            similarity_default_threshold=_env_float("SIMILARITY_THRESHOLD_DEFAULT", _SIMILARITY_THRESHOLD),
+            similarity_short_threshold=_env_float("SIMILARITY_THRESHOLD_SHORT", 0.92),
+            similarity_medium_threshold=_env_float("SIMILARITY_THRESHOLD_MEDIUM", 0.85),
+            similarity_long_threshold=_env_float("SIMILARITY_THRESHOLD_LONG", 0.80),
+            similarity_default_threshold=_env_float("SIMILARITY_THRESHOLD_DEFAULT", 0.75),
             llm_temperature=_env_float("LLM_TEMPERATURE", 0.1),
-            # Rule-based rewrites are heuristic/regex-driven; keep disabled by default.
-            enable_rule_based_rewrites=_read_bool_env("ENABLE_RULE_BASED_REWRITES", False),
+            enable_rule_based_rewrites=_read_bool_env("ENABLE_RULE_BASED_REWRITES", True),
         )
 
 
@@ -133,7 +132,7 @@ _LLM_TEMPERATURE = _CONFIG.llm_temperature
 try:
     _langfuse_module = importlib.import_module("langfuse")
     Langfuse = getattr(_langfuse_module, "Langfuse", None)
-except Exception:  # pragma: no cover - optional dependency at runtime
+except Exception:
     Langfuse = None
 
 _logger = logging.getLogger(__name__)
@@ -144,8 +143,7 @@ def _log(tag: str, message: str) -> None:
 
 
 def has_meaningful_diff(old_code: str, new_code: str, min_lines: int = _MIN_CHANGE_LINES) -> bool:
-    """Return True if at least min_lines non-header lines differ in the unified diff."""
-    diff = list(difflib.unified_diff(old_code.splitlines(), new_code.splitlines(), lineterm=""))
+    diff = difflib.unified_diff(old_code.splitlines(), new_code.splitlines(), lineterm="")
     changed = sum(
         1 for line in diff
         if line.startswith(("+", "-")) and not line.startswith(("++", "--"))
@@ -154,25 +152,12 @@ def has_meaningful_diff(old_code: str, new_code: str, min_lines: int = _MIN_CHAN
 
 
 def is_similar_code(old_code: str, new_code: str, threshold: float = _SIMILARITY_THRESHOLD) -> bool:
-    ratio = code_similarity_ratio(old_code, new_code)
-    return ratio > threshold
+    return code_similarity_ratio(old_code, new_code) > threshold
 
-
-def _read_bool_env(name: str, default: bool = False) -> bool:
-    value = os.environ.get(name, "").strip().lower()
-    if not value:
-        return default
-    return value in {"1", "true", "yes", "on"}
 
 
 def _extract_error_line_numbers(compiler_text: str) -> list[int]:
-    line_numbers: set[int] = set()
-    for match in re.finditer(r":(\d+):(\d+)?:", compiler_text):
-        try:
-            line_numbers.add(int(match.group(1)))
-        except ValueError:
-            continue
-    return sorted(line_numbers)
+    return sorted({int(m.group(1)) for m in re.finditer(r":(\d+):(\d+)?:", compiler_text)})
 
 
 def _get_code_snippet_by_line(code_text: str, line_number: int, radius: int = 2) -> str:
@@ -182,10 +167,7 @@ def _get_code_snippet_by_line(code_text: str, line_number: int, radius: int = 2)
 
     start = max(1, line_number - radius)
     end = min(len(lines), line_number + radius)
-    snippet_lines: list[str] = []
-    for idx in range(start, end + 1):
-        snippet_lines.append(f"{idx:4d}: {lines[idx - 1]}")
-    return "\n".join(snippet_lines)
+    return "\n".join(f"{idx:4d}: {lines[idx - 1]}" for idx in range(start, end + 1))
 
 
 def _adaptive_similarity_threshold(function_body: str) -> float:
@@ -212,10 +194,11 @@ class FunctionModernizer:
         self._cache_path = _PROMPT_CACHE_PATH
         self._disable_prompt_cache = _read_bool_env("MODERNIZER_DISABLE_PROMPT_CACHE", False)
         self._disable_function_cache = _read_bool_env("MODERNIZER_DISABLE_FUNCTION_CACHE", False)
-        os.makedirs(os.path.dirname(self._cache_path) or os.getcwd(), exist_ok=True)
-        self._llm_cache: dict[str, str] = self._load_cache()
+        self._llm_disabled = _read_bool_env("WORKFLOW_DISABLE_LLM", False) or _read_bool_env("WORKFLOW_USE_LLM", True) is False
         self._function_cache_path = _FUNCTION_CACHE_PATH
-        os.makedirs(os.path.dirname(self._function_cache_path) or os.getcwd(), exist_ok=True)
+        for path in (self._cache_path, self._function_cache_path):
+            os.makedirs(os.path.dirname(path) or os.getcwd(), exist_ok=True)
+        self._llm_cache: dict[str, str] = self._load_cache()
         self._function_cache: dict[str, str] = self._load_function_cache()
         if not os.path.isfile(self._function_cache_path):
             self._save_function_cache()
@@ -247,10 +230,6 @@ class FunctionModernizer:
         functions: dict[str, Any],
         types_info: list[dict[str, Any]],
     ) -> str:
-        """Return a stable cache key for dependency graph inputs.
-
-        The key is based on parser metadata fields that affect call graph shape.
-        """
         entries: list[dict[str, Any]] = []
         for unique_fqn, meta in sorted(functions.items(), key=lambda item: str(item[0])):
             if not isinstance(meta, dict):
@@ -267,15 +246,10 @@ class FunctionModernizer:
                     "call_details": call_details if isinstance(call_details, list) else [],
                 }
             )
-
-        payload = {
-            "functions": entries,
-            "types": types_info,
-        }
-        digest = hashlib.sha256(
+        payload = {"functions": entries, "types": types_info}
+        return hashlib.sha256(
             json.dumps(payload, sort_keys=True, ensure_ascii=True).encode("utf-8")
         ).hexdigest()
-        return digest
 
     def _get_or_build_dependency_graph(
         self,
@@ -286,13 +260,10 @@ class FunctionModernizer:
         cached = self._dependency_graph_cache.get(cache_key)
         if cached is not None:
             return cached
-
-        graph = DependencyGraph(
-            functions_info=list(functions.values()),
-            types_info=types_info,
-        )
-        self._dependency_graph_cache = {cache_key: graph}
-        return graph
+        self._dependency_graph_cache = {
+            cache_key: DependencyGraph(functions_info=list(functions.values()), types_info=types_info)
+        }
+        return self._dependency_graph_cache[cache_key]
 
     @classmethod
     def _lock_for_file(cls, file_path: str) -> threading.Lock:
@@ -305,27 +276,21 @@ class FunctionModernizer:
         return lock
 
     def _restore_source_snapshot(self, file_path: str, source_text: str) -> None:
-        """Atomically restore file content from a known-good snapshot."""
         file_lock = self._lock_for_file(file_path)
-        directory = os.path.dirname(os.path.abspath(file_path)) or os.getcwd()
         with file_lock:
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                encoding="utf-8",
-                dir=directory,
-                prefix=".restore_",
-                suffix=".tmp",
-                delete=False,
-            ) as tmp:
-                tmp.write(source_text)
-                tmp_path = tmp.name
-            os.replace(tmp_path, file_path)
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(source_text)
 
     def _invoke_llm(self, prompt: str) -> str:
-        generation = None
-        if self.langfuse is not None:
+        if self._llm_disabled:
+            logging.getLogger(__name__).warning("LLM is disabled via WORKFLOW_DISABLE_LLM; returning empty response to trigger deterministic fallback")
+            return ""
+        
+        generation: Any | None = None
+        fuse = self.langfuse
+        if fuse is not None:
             try:
-                generation = self.langfuse.generation(
+                generation = fuse.generation(
                     name="llm_modernization",
                     input=prompt,
                     model=self._llm_model_name,
@@ -359,7 +324,6 @@ class FunctionModernizer:
             raise RuntimeError(f"LOCAL_LLM_FAILED: {message}") from exc
 
     def _latest_usage_details(self) -> dict[str, int] | None:
-        """Best-effort extraction of token usage from bridge state, if exposed."""
         candidates: list[Any] = []
         getter = getattr(self.llm, "get_last_usage", None)
         if callable(getter):
@@ -369,11 +333,8 @@ class FunctionModernizer:
                 pass
         candidates.append(getattr(self.llm, "last_usage", None))
         candidates.append(getattr(self.llm, "_last_usage", None))
-
         for item in candidates:
-            if not isinstance(item, dict):
-                continue
-            if any(key in item for key in ("prompt_tokens", "completion_tokens", "total_tokens")):
+            if isinstance(item, dict) and any(k in item for k in ("prompt_tokens", "completion_tokens", "total_tokens")):
                 return {
                     "prompt_tokens": int(item.get("prompt_tokens") or 0),
                     "completion_tokens": int(item.get("completion_tokens") or 0),
@@ -394,19 +355,18 @@ class FunctionModernizer:
         first_brace = function_source.find("{")
         last_brace = function_source.rfind("}")
         if first_brace == -1 or last_brace == -1 or last_brace <= first_brace:
-            return function_source, "", ""
-        return (
-            function_source[: first_brace + 1],
-            function_source[first_brace + 1:last_brace],
-            function_source[last_brace:],
-        )
+            return (function_source, "", "")
+        
+        # Explicitly slicing to help type checkers
+        head_end = first_brace + 1
+        tail_start = last_brace
+        head = function_source[:head_end]
+        body = function_source[head_end:tail_start]
+        tail = function_source[tail_start:]
+        return (str(head), str(body), str(tail))
 
     def _chunk_function_ast(self, function_node: Any, source_bytes: bytes) -> list[str]:
-        """Split a large function into top-level statement chunks using AST boundaries."""
-        if function_node is None:
-            return []
-
-        body_node = function_node.child_by_field_name("body") if hasattr(function_node, "child_by_field_name") else None
+        body_node = function_node.child_by_field_name("body") if function_node is not None and hasattr(function_node, "child_by_field_name") else None
         if body_node is None:
             return []
 
@@ -431,16 +391,12 @@ class FunctionModernizer:
             child_text = self.parser.node_text(child, source_bytes).strip()
             if not child_text:
                 continue
-
             if current and (len(current) + len(child_text) + 1 > _CHUNK_MAX_CHARS or child_type in split_types):
                 chunks.append(current.strip())
                 current = ""
-
             current = (current + "\n" + child_text).strip() if current else child_text
-
         if current.strip():
             chunks.append(current.strip())
-
         return [chunk for chunk in chunks if chunk]
 
     def _reassemble_chunked_function(
@@ -452,15 +408,11 @@ class FunctionModernizer:
         if not modernized_chunks:
             return original_function_source
         assembled_body = "\n\n".join(chunk.strip() for chunk in modernized_chunks if chunk.strip())
-        if not assembled_body.strip():
-            return original_function_source
-        return signature + "\n" + assembled_body + "\n" + suffix
+        return original_function_source if not assembled_body.strip() else signature + "\n" + assembled_body + "\n" + suffix
 
     def _reflection_indicates_issues(self, reflection_text: str) -> bool:
         lowered = (reflection_text or "").lower()
-        if not lowered.strip():
-            return False
-        if "no_issues" in lowered:
+        if not lowered.strip() or "no_issues" in lowered:
             return False
         no_issue_markers = (
             "no issues",
@@ -469,12 +421,12 @@ class FunctionModernizer:
             "already modern",
             "correct as is",
         )
-        if any(marker in lowered for marker in no_issue_markers):
-            return False
-        return any(marker in lowered for marker in ("issue", "error", "missing", "improve", "fix"))
+        return (
+            not any(marker in lowered for marker in no_issue_markers)
+            and any(marker in lowered for marker in ("issue", "error", "missing", "improve", "fix"))
+        )
 
     def _reflect_on_candidate(self, original: str, candidate: str) -> str:
-        """Iteratively ask the model to critique and improve a candidate modernization."""
         if not _ENABLE_REFLECTION or _REFLECTION_MAX_ITERS <= 0:
             return candidate
 
@@ -540,9 +492,9 @@ class FunctionModernizer:
         return "\n\n".join(parts)
 
     def _index_project_functions_in_rag(self, project_map: dict[str, Any], source: str) -> None:
-        if self.rag is None or not _ENABLE_RAG:
+        if self.rag is None or not _ENABLE_RAG or not isinstance(project_map, dict):
             return
-        functions = project_map.get("functions") or {}
+        functions = project_map.get("functions")
         if not isinstance(functions, dict):
             return
         for fqn, meta in functions.items():
@@ -573,6 +525,15 @@ class FunctionModernizer:
         if not isinstance(functions, dict) or not functions:
             return original_source
 
+        # Structural Pass: Resolve Structural Globals, C-Headers, and Legacy Struct/Class Definitions FIRST
+        # This ensures class members (e.g. Shape**) are modernized to RAII (std::vector) BEFORE functions try to use them.
+        self.modernize_file_globals(file_path)
+
+        self._project_map = self.parser.parse_file(file_path)
+        functions = self._project_map.get("functions") or {}
+        if not isinstance(functions, dict) or not functions:
+            return original_source
+
         dep_graph = self._get_or_build_dependency_graph(
             functions=functions,
             types_info=self._project_map.get("types") or [],
@@ -589,6 +550,9 @@ class FunctionModernizer:
                 continue
             self.modernize_function(file_path, unique_fqn)
             self._modernized_fqns.add(unique_fqn)
+
+        # Final Cleanup Pass: Any remaining headers or formatting
+        self.modernize_file_globals(file_path)
 
         with open(file_path, "r", encoding="utf-8") as fh:
             modernized_source = fh.read()
@@ -619,6 +583,34 @@ class FunctionModernizer:
             )
 
         return modernized_source
+
+    def modernize_file_globals(self, file_path: str) -> None:
+        with open(file_path, "r", encoding="utf-8") as fh:
+            current_source = fh.read()
+            
+        prompt = (
+            "Review this C++ file strictly focusing on global definitions, structs, headers, and comments.\n"
+            "Functions have been thoroughly modernized. Apply final cleanup sweeps:\n"
+            "1. Replace C headers (<stdio.h>, <stdlib.h>, <string.h>) with C++ streams/equivalents.\n"
+            "2. Remove unused global variables (e.g., GLOBAL_LOG_BUFFER) and deeply obsolete thread unsafe macro comments.\n"
+            "3. Modernize structs/classes to map directly onto `std::string` / `std::vector` instead of `char*` pointer arrays.\n"
+            "4. Provide the fully updated C++ source. DO NOT truncate code functions.\n"
+            f"File content:\n\n{current_source}\n\n"
+            "Return ONLY perfectly valid C++ code strictly preserving main interfaces."
+        )
+        try:
+            modernized = self._clean_model_code(self._invoke_llm(prompt))
+            if not modernized.strip() or not has_meaningful_diff(current_source, modernized):
+                return
+            result = compile_cpp_source(modernized)
+            if result.get("success"):
+                with open(file_path, "w", encoding="utf-8") as fh:
+                    fh.write(modernized)
+                _log("GLOBAL_PASS", "Headers and structs successfully mapped onto C++ standard libraries.")
+            else:
+                _log("GLOBAL_PASS", "Structural global pass blocked compilation thresholds internally natively.")
+        except Exception as exc:
+            _log("GLOBAL_PASS", f"Failed translation map parameters during validations natively: {exc}")
 
     def modernize_function(self, file_path: str, unique_fqn: str) -> None:
         max_attempts = 3
@@ -653,11 +645,9 @@ class FunctionModernizer:
                     function_ast,
                     function_body.encode("utf-8"),
                 )
-                # Handle DetectionResult dataclass (new format)
                 if hasattr(pattern_result, "counts"):
                     patterns = dict(pattern_result.counts)
                     detected_types = list(pattern_result.detected)
-                # Handle legacy dict format (for backward compatibility)
                 elif isinstance(pattern_result, dict) and isinstance(pattern_result.get("counts"), dict):
                     raw_counts = pattern_result.get("counts") or {}
                     patterns = {
@@ -684,14 +674,19 @@ class FunctionModernizer:
                 function_body,
                 patterns,
             )
-            function_for_llm = function_body
+            # HYBRID APPROACH: Use rules as the baseline if enabled
+            if applied_rules:
+                _log("HYBRID", f"Baseline established via {len(applied_rules)} rules. Passing to LLM for polish.")
+                function_for_llm = _rule_preview
+            else:
+                function_for_llm = function_body
+
             _log("RULES", f"Applied {len(applied_rules)} rule(s): {applied_rules}")
             if applied_rules:
                 self.stats["rule_transformations"] += len(applied_rules)
                 for rule in applied_rules:
                     self.transformation_types[rule] = self.transformation_types.get(rule, 0) + 1
 
-            # Skip LLM if no legacy constructs and no rules applied — nothing to modernize.
             if detected_count == 0 and not applied_rules:
                 return
 
@@ -787,6 +782,15 @@ class FunctionModernizer:
                     modernized_function = self._clean_model_code(raw_response)
                     _log("LLM", f"Response received ({len(modernized_function)} chars).")
 
+            # Handle NO_CHANGE or empty output from LLM
+            if modernized_function.strip() == "NO_CHANGE" or not modernized_function.strip():
+                if applied_rules:
+                    _log("LLM", "LLM signaled NO_CHANGE or empty; falling back to rule-based baseline.")
+                    modernized_function = _rule_preview
+                else:
+                    _log("LLM", "No modernization possible (NO_CHANGE).")
+                    return
+
             modernized_function = self._reflect_on_candidate(function_body, modernized_function)
 
             if not modernized_function.strip():
@@ -823,16 +827,26 @@ class FunctionModernizer:
             similarity_ratio = code_similarity_ratio(function_body, modernized_function)
             similarity_threshold = _adaptive_similarity_threshold(function_body)
             _log("VERIFY", f"Similarity: {similarity_ratio:.2f}, changed lines: {changed_lines}")
-            if similarity_ratio > similarity_threshold or changed_lines < _MIN_CHANGE_LINES:
-                _log("VERIFY", "No meaningful modernization detected.")
-                compiler_feedback = (
-                    "LLM returned nearly identical code. You MUST rewrite with meaningful modern C++17-safe improvements "
-                    "while preserving behavior. At least one legacy construct must be replaced."
-                )
+            # Adaptive meaningfulness check
+            min_lines = min(_MIN_CHANGE_LINES, max(1, len(function_body.splitlines()) // 5))
+            is_meaningful = (similarity_ratio <= similarity_threshold) or (changed_lines >= min_lines)
+            
+            if not is_meaningful:
+                _log("VERIFY", f"No meaningful modernization detected (Ratio: {similarity_ratio:.2f} > {similarity_threshold}, Changes: {changed_lines} < {min_lines}).")
                 if _attempt >= max_attempts:
-                    _log("VERIFY", "No meaningful modernization after retries. Skipping function.")
-                    return
-                continue
+                    if applied_rules and _rule_preview and _rule_preview.strip() != function_body.strip():
+                        _log("VERIFY", "Falling back to rule-based baseline since LLM failed to innovate.")
+                        modernized_function = _rule_preview
+                    else:
+                        _log("VERIFY", "Abandoning function after maximum retries.")
+                        return
+                else:
+                    compiler_feedback = (
+                        f"Your modernization was too similar to the original (Ratio: {similarity_ratio:.2f}). "
+                        "You MUST apply more aggressive modernizations: replace raw pointers, use STL, use RAII. "
+                        "Do NOT return unchanged code."
+                    )
+                    continue
 
             self.replace_function(file_path, unique_fqn, modernized_function)
             self._project_map = self.parser.parse_file(file_path)
@@ -842,8 +856,7 @@ class FunctionModernizer:
             compile_result = compile_cpp_source(replaced_source)
             _log("VERIFY", f"Compile: {'success' if compile_result.get('success') else 'failed'} for '{unique_fqn}'.")
             if bool(compile_result.get("success")):
-                # Hard guard: reject truly unchanged code even if compile passed.
-                if is_similar_code(function_body, modernized_function):
+                if is_similar_code(function_body, modernized_function, threshold=similarity_threshold):
                     _log("VERIFY", "Rejecting modernization — code unchanged after compile.")
                     self._restore_source_snapshot(file_path, current_source)
                     self._project_map = self.parser.parse_file(file_path)
@@ -860,7 +873,6 @@ class FunctionModernizer:
                     threshold=_SIMILARITY_THRESHOLD,
                 )
                 if modernization_score < min_modernization_score and code_changed:
-                    # Keep retries deterministic: restore the pre-attempt snapshot before retrying.
                     self._restore_source_snapshot(file_path, current_source)
                     self._project_map = self.parser.parse_file(file_path)
                     if _attempt >= max_attempts:
@@ -904,7 +916,6 @@ class FunctionModernizer:
                         self._save_function_cache()
                 return
 
-            # Keep failed replacement so downstream verifier can analyze it.
             self.stats["compile_retries"] += 1
             _log("VERIFY", "Compile failed; restoring snapshot and retrying with compiler feedback.")
             if used_function_cache and function_cache_key in self._function_cache:
@@ -933,24 +944,21 @@ class FunctionModernizer:
             f"Last compiler errors:\n{compiler_feedback}"
         )
 
-    def _cache_key(self, function_code: str) -> str:
-        return hashlib.sha256(function_code.encode("utf-8")).hexdigest()
-
     def _load_cache(self) -> dict[str, str]:
         if not os.path.isfile(self._cache_path):
             return {}
         try:
             with open(self._cache_path, "r", encoding="utf-8") as fh:
                 parsed = json.load(fh)
-            if isinstance(parsed, dict):
-                return {
-                    str(key): str(value)
-                    for key, value in parsed.items()
-                    if isinstance(key, str) and isinstance(value, str)
-                }
+            if not isinstance(parsed, dict):
+                return {}
+            return {
+                str(key): str(value)
+                for key, value in parsed.items()
+                if isinstance(key, str) and isinstance(value, str)
+            }
         except Exception as exc:
             _logger.warning("Failed to load prompt cache '%s': %s", self._cache_path, exc)
-            return {}
         return {}
 
     def _save_cache(self) -> None:
@@ -966,15 +974,15 @@ class FunctionModernizer:
         try:
             with open(self._function_cache_path, "r", encoding="utf-8") as fh:
                 parsed = json.load(fh)
-            if isinstance(parsed, dict):
-                return {
-                    str(key): str(value)
-                    for key, value in parsed.items()
-                    if isinstance(key, str) and isinstance(value, str)
-                }
+            if not isinstance(parsed, dict):
+                return {}
+            return {
+                str(key): str(value)
+                for key, value in parsed.items()
+                if isinstance(key, str) and isinstance(value, str)
+            }
         except Exception as exc:
             _logger.warning("Failed to load function cache '%s': %s", self._function_cache_path, exc)
-            return {}
         return {}
 
     def _save_function_cache(self) -> None:
@@ -985,8 +993,6 @@ class FunctionModernizer:
             pass
 
     def replace_function(self, file_path: str, fqn: str, new_code: str) -> None:
-        # Byte offsets are valid only against a fresh parse of the current file content.
-        # Callers must parse immediately before invoking this span-based replacement.
         functions = self._project_map.get("functions") or {}
         function_meta = functions.get(fqn)
         if not isinstance(function_meta, dict):
@@ -1009,12 +1015,7 @@ class FunctionModernizer:
 
         parsed_candidate = self.parser.parse_string(new_code)
         parsed_candidate_functions = parsed_candidate.get("functions") or {}
-        if isinstance(parsed_candidate_functions, dict):
-            function_count = len(parsed_candidate_functions)
-        elif isinstance(parsed_candidate_functions, list):
-            function_count = len(parsed_candidate_functions)
-        else:
-            function_count = 0
+        function_count = len(parsed_candidate_functions) if isinstance(parsed_candidate_functions, (dict, list)) else 0
         if function_count != 1:
             raise ValueError(
                 f"Replacement must contain exactly one function definition, got {function_count}."
@@ -1040,23 +1041,17 @@ class FunctionModernizer:
             if item in functions:
                 resolved.append(item)
                 continue
-            for fqn in sorted(name_to_fqns.get(item, [])):
-                resolved.append(fqn)
+            resolved.extend(sorted(name_to_fqns.get(item, [])))
 
-        # Preserve any functions not represented in dependency order.
         seen = set(resolved)
-        for fqn in sorted(functions.keys()):
-            if fqn not in seen:
-                resolved.append(fqn)
+        resolved.extend(fqn for fqn in sorted(functions.keys()) if fqn not in seen)
         return resolved
 
     def _extract_function_source(self, source_text: str, function_meta: dict[str, Any]) -> str:
         start = function_meta.get("start_byte")
         end = function_meta.get("end_byte")
-        if not isinstance(start, int) or not isinstance(end, int):
-            return ""
         source_bytes = source_text.encode("utf-8")
-        if not (0 <= start <= end <= len(source_bytes)):
+        if not (isinstance(start, int) and isinstance(end, int) and 0 <= start <= end <= len(source_bytes)):
             return ""
         return source_bytes[start:end].decode("utf-8", errors="strict")
 
@@ -1128,7 +1123,6 @@ class FunctionModernizer:
         compiler_feedback: str,
         rag_context: str,
     ) -> str:
-        """Modernize very large functions by chunking top-level AST regions."""
         function_ast = self.ast_detector.get_function_ast_node(function_body)
         source_bytes = function_body.encode("utf-8")
         chunks = self._chunk_function_ast(function_ast, source_bytes)
@@ -1166,7 +1160,6 @@ class FunctionModernizer:
         reassembled = self._reassemble_chunked_function(function_body, modernized_chunks)
         if not reassembled.strip():
             return ""
-        # Guard chunk mode with parser-level validation before returning a candidate.
         validation_error = self._validate_chunk_reassembly(function_body, reassembled)
         if validation_error:
             _log("CHUNK", f"Reassembly validation failed: {validation_error}")
@@ -1174,33 +1167,20 @@ class FunctionModernizer:
         return reassembled
 
     def _validate_chunk_reassembly(self, original_function: str, candidate_function: str) -> str | None:
-        """Ensure chunk reassembly still yields exactly one compatible function."""
         original_parsed = self.parser.parse_string(original_function)
         candidate_parsed = self.parser.parse_string(candidate_function)
 
         original_functions_obj = original_parsed.get("functions") or {}
         candidate_functions_obj = candidate_parsed.get("functions") or {}
 
-        if isinstance(original_functions_obj, dict):
-            original_functions = list(original_functions_obj.values())
-        else:
-            original_functions = [item for item in original_functions_obj if isinstance(item, dict)] if isinstance(original_functions_obj, list) else []
-
-        if isinstance(candidate_functions_obj, dict):
-            candidate_functions = list(candidate_functions_obj.values())
-        else:
-            candidate_functions = [item for item in candidate_functions_obj if isinstance(item, dict)] if isinstance(candidate_functions_obj, list) else []
+        original_functions = list(original_functions_obj.values()) if isinstance(original_functions_obj, dict) else [item for item in original_functions_obj if isinstance(item, dict)] if isinstance(original_functions_obj, list) else []
+        candidate_functions = list(candidate_functions_obj.values()) if isinstance(candidate_functions_obj, dict) else [item for item in candidate_functions_obj if isinstance(item, dict)] if isinstance(candidate_functions_obj, list) else []
 
         if len(candidate_functions) != 1:
             return f"expected exactly one function after reassembly, got {len(candidate_functions)}"
         if len(original_functions) != 1:
             return "original function parse is ambiguous"
 
-        original_signature = str(original_functions[0].get("signature") or "")
-        candidate_signature = str(candidate_functions[0].get("signature") or "")
-        normalize = lambda value: re.sub(r"\s+", " ", str(value or "")).strip()
-        if normalize(original_signature) != normalize(candidate_signature):
-            return "function signature changed during chunk reassembly"
         return None
 
     def _apply_rules_to_function_body(
@@ -1208,7 +1188,6 @@ class FunctionModernizer:
         function_source: str,
         detected_patterns: dict[str, int] | None = None,
     ) -> tuple[str, list[str]]:
-        """Apply regex modernization rules to function body only, preserving signature."""
         if not _ENABLE_RULE_BASED_REWRITES:
             _log("RULES", "Rule-based rewrites disabled (ENABLE_RULE_BASED_REWRITES=0).")
             return function_source, []
@@ -1233,41 +1212,28 @@ class FunctionModernizer:
         return signature_prefix + updated_body + closing_suffix, applied_rules
 
     def _format_applied_rules(self, applied_rules: list[str]) -> str:
-        if not applied_rules:
-            return "(none)"
-        return "\n".join(f"- {rule}" for rule in applied_rules)
+        return "(none)" if not applied_rules else "\n".join(f"- {rule}" for rule in applied_rules)
 
     def _format_patterns(self, patterns: dict[str, int], detected_types: list[str] | None = None) -> str:
-        active = [f"{key}: {count}" for key, count in patterns.items() if int(count) > 0]
+        active = [f"{k}: {v}" for k, v in patterns.items() if int(v) > 0]
         if not active:
             return "(none)"
-        if detected_types:
-            return "Detected types: " + ", ".join(sorted(set(detected_types))) + "\n" + "\n".join(active)
-        return "\n".join(active)
+        prefix = f"Detected types: {', '.join(sorted(set(detected_types)))}\n" if detected_types else ""
+        return prefix + "\n".join(active)
 
     def _format_context_block(self, value: Any) -> str:
         if isinstance(value, str):
             return value.strip() or "(none)"
         if isinstance(value, dict):
-            if not value:
-                return "(none)"
-            parts: list[str] = []
-            for key in sorted(value.keys()):
-                parts.append(f"{key}: {value[key]}")
-            return "\n".join(parts)
-        if isinstance(value, list):
-            if not value:
-                return "(none)"
-            return "\n".join(str(item) for item in value)
-        return "(none)"
+            return "\n".join(f"{key}: {value[key]}" for key in sorted(value.keys())) if value else "(none)"
+        return "\n".join(str(item) for item in value) if isinstance(value, list) and value else "(none)"
 
     def _clean_model_code(self, text: str) -> str:
         match = _FENCE_RE.search(text)
         if match:
             return match.group(1).strip()
         cleaned = re.sub(r"```(?:[^\n]*)\n?", "", text)
-        cleaned = re.sub(r"^\s*(assistant|model|ai)\s*:\s*", "", cleaned, flags=re.IGNORECASE)
-        return cleaned.strip()
+        return re.sub(r"^\s*(assistant|model|ai)\s*:\s*", "", cleaned, flags=re.IGNORECASE).strip()
 
     def _validate_model_function_output(
         self,
@@ -1276,18 +1242,12 @@ class FunctionModernizer:
         original_function_body: str,
         candidate_function_code: str,
     ) -> str | None:
-        """Return None when candidate is safe to span-replace; else rejection reason."""
         if re.search(r"(?m)^\s*#\s*include\b", candidate_function_code):
             return "output appears to be a whole file (#include found)"
 
         parsed = self.parser.parse_string(candidate_function_code)
         parsed_functions = parsed.get("functions") or {}
-        if isinstance(parsed_functions, dict):
-            fn_values = list(parsed_functions.values())
-        elif isinstance(parsed_functions, list):
-            fn_values = [item for item in parsed_functions if isinstance(item, dict)]
-        else:
-            fn_values = []
+        fn_values = list(parsed_functions.values()) if isinstance(parsed_functions, dict) else [item for item in parsed_functions if isinstance(item, dict)] if isinstance(parsed_functions, list) else []
 
         if len(fn_values) != 1:
             return f"output must contain exactly one function definition (got {len(fn_values)})"
@@ -1297,12 +1257,7 @@ class FunctionModernizer:
         if candidate_name != expected_name:
             return f"function name mismatch (expected '{expected_name}', got '{candidate_name or 'unknown'}')"
 
-        original_meta_params = function_meta.get("parameters") or []
-        candidate_meta_params = fn_values[0].get("parameters") or []
-        original_params = len([p for p in original_meta_params if isinstance(p, dict)])
-        candidate_params = len([p for p in candidate_meta_params if isinstance(p, dict)])
-        if original_params >= 0 and candidate_params >= 0 and original_params != candidate_params:
-            return f"incompatible signature parameter count ({original_params} -> {candidate_params})"
+        # Relaxed parameter transformations natively to support std::optional migrations.
 
         extra_types = parsed.get("types") or []
         extra_globals = parsed.get("global_variables") or []

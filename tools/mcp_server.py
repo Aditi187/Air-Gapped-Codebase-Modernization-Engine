@@ -1,40 +1,18 @@
-﻿import os
-import shlex
-import subprocess
-import re
-import glob
-import json
-import sys
-import hashlib
+﻿import os, shlex, subprocess, re, glob, json, sys, hashlib, threading, time
 from pathlib import Path
-# Prefer non-destructive stream hardening: keep terminal encoding and only
-# switch to replacement mode when UTF support is missing.
-def _configure_stream_encoding(stream: object) -> None:
-    reconfigure = getattr(stream, "reconfigure", None)
-    encoding = str(getattr(stream, "encoding", "") or "").lower()
-    if callable(reconfigure) and "utf" not in encoding:
-        reconfigure(errors="replace")
-
-
-_configure_stream_encoding(sys.stdout)
-_configure_stream_encoding(sys.stderr)
-
-import threading
-import time
 from datetime import datetime
-
+from typing import Any
 from dotenv import load_dotenv
-from typing import Optional
 from fastmcp import FastMCP
 
-# Make the project root importable so we can reach core.parser.
+for s in (sys.stdout, sys.stderr):
+    reconfigure = getattr(s, "reconfigure", None)
+    if callable(reconfigure) and "utf" not in str(getattr(s, "encoding", "")).lower():
+        reconfigure(errors="replace")
+
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _PROJECT_ROOT)
-
-load_dotenv(
-    dotenv_path=os.path.join(_PROJECT_ROOT, ".env"),
-    override=True,
-)  # Load .env from project root explicitly and override inherited empty values.
+load_dotenv(dotenv_path=os.path.join(_PROJECT_ROOT, ".env"), override=True)
 
 from core.logger import get_logger
 logger = get_logger(__name__)
@@ -46,7 +24,14 @@ try:
     from core.parser import CppParser
     _PARSER_AVAILABLE = True
 except Exception:
+    CppParser = None
     _PARSER_AVAILABLE = False
+
+
+def _new_cpp_parser() -> Any:
+    if CppParser is None:
+        raise RuntimeError("core.parser.CppParser is unavailable")
+    return CppParser()
 
 
 mcp_server = FastMCP("air-gapped-code-tools")
@@ -54,17 +39,11 @@ mcp_server = FastMCP("air-gapped-code-tools")
 
 ALLOWED_ROOT = os.path.abspath(os.getcwd())
 
-# ---------------------------------------------------------------------------
-# Directories to skip during recursive scans (performance / noise).
-# ---------------------------------------------------------------------------
 _IGNORED_DIRS: set[str] = {
     "node_modules", ".git", "build", "vcpkg_installed",
     "__pycache__", ".venv", "venv", ".vs", ".cache", ".mypy_cache",
 }
 
-# ---------------------------------------------------------------------------
-# Whitelist of allowed compiler / build-tool binaries for run_compiler.
-# ---------------------------------------------------------------------------
 _ALLOWED_COMPILERS: set[str] = {
     "g++", "gcc", "c++", "cc",
     "clang++", "clang",
@@ -134,7 +113,7 @@ def _mcp_warmup() -> None:
     _GlobalProjectMapCache.get().build_in_background()
     if _PARSER_AVAILABLE:
         try:
-            CppParser().parse_string("int __mcp_warmup__() { return 0; }")
+            _new_cpp_parser().parse_string("int __mcp_warmup__() { return 0; }")
             logger.info("MCP warmup: parser ready.")
         except Exception as exc:
             logger.warning("MCP warmup: parser preflight failed: %r", exc)
@@ -159,84 +138,50 @@ def call_model(system_prompt: str, user_prompt: str) -> str:
 
 
 def _read_text_if_exists(path: str) -> str:
-    """Read UTF-8 text from a path, returning an empty string on failure."""
     try:
-        if os.path.isfile(path):
-            with open(path, "r", encoding="utf-8") as fh:
-                return fh.read()
+        return Path(path).read_text(encoding="utf-8") if os.path.isfile(path) else ""
     except Exception:
         return ""
-    return ""
 
 
 def _extract_cpp_inputs_from_command(
     command_parts: list[str],
-    working_directory_resolved: Optional[str],
+    working_directory_resolved: str | None,
 ) -> list[dict[str, str]]:
-    """Extract C++ source files from a compiler command and return their content."""
     sources: list[dict[str, str]] = []
     seen_paths: set[str] = set()
     cpp_exts = {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx"}
-    base_dir = working_directory_resolved or ALLOWED_ROOT
-
+    base = working_directory_resolved or ALLOWED_ROOT
     for token in command_parts[1:]:
         if not token or token.startswith("-"):
             continue
-
         candidate = token.strip().strip('"').strip("'")
         if not candidate:
             continue
-
-        resolved_path = candidate
-        if not os.path.isabs(resolved_path):
-            resolved_path = os.path.normpath(os.path.join(base_dir, resolved_path))
-        else:
-            resolved_path = os.path.normpath(resolved_path)
-
+        path = candidate if os.path.isabs(candidate) else os.path.normpath(os.path.join(base, candidate))
+        path = os.path.normpath(path)
         try:
-            resolved_path = _ensure_within_allowed_root(resolved_path)
+            path = _ensure_within_allowed_root(path)
         except ValueError:
             continue
-
-        if os.path.splitext(resolved_path)[1].lower() not in cpp_exts:
+        if os.path.splitext(path)[1].lower() not in cpp_exts or path in seen_paths:
             continue
-        if resolved_path in seen_paths:
-            continue
-
-        code = _read_text_if_exists(resolved_path)
+        code = _read_text_if_exists(path)
         if not code:
             continue
-
-        seen_paths.add(resolved_path)
-        rel_path = (
-            os.path.relpath(resolved_path, ALLOWED_ROOT)
-            if resolved_path.startswith(ALLOWED_ROOT)
-            else resolved_path
-        )
-        sources.append({"path": rel_path, "code": code})
-
+        seen_paths.add(path)
+        rel = os.path.relpath(path, ALLOWED_ROOT) if path.startswith(ALLOWED_ROOT) else path
+        sources.append({"path": rel, "code": code})
     return sources
 
 
-# ===================================================================
-# Standardised JSON result helper
-# ===================================================================
-
 def _make_result(status: str, **kwargs) -> str:
-    """Build a JSON-ready result dict for uniform tool output.
-
-    Every MCP tool returns this format so LLM / workflow consumers can
-    rely on a predictable schema::
-
-        {"status": "success"|"error", ...extra_fields}
-    """
-    payload: dict = {"status": status}
+    payload = {"status": status}
     payload.update(kwargs)
     return json.dumps(payload, indent=2, default=str)
 
 
 def _result_to_dict(result: str) -> dict:
-    """Safely parse a JSON result string into a dict for tracing payloads."""
     try:
         parsed = json.loads(result)
         if isinstance(parsed, dict):
@@ -246,88 +191,40 @@ def _result_to_dict(result: str) -> dict:
     return {"status": "error", "message": "unparseable result payload"}
 
 
-# ===================================================================
-# Sandbox helpers
-# ===================================================================
-
 def _contains_parent_traversal(path: str) -> bool:
-    """Return True if the path tries to go up a directory using '..'."""
-    normalized = path.replace("\\", "/")
-    parts = [p for p in normalized.split("/") if p]
-    return ".." in parts
+    return ".." in path.replace("\\", "/").split("/")
 
 
 def _ensure_within_allowed_root(path: str) -> str:
-    """Normalise *path*, resolve symlinks, and verify it stays inside ALLOWED_ROOT.
-
-    Symlinks are resolved before path comparison so symlink escapes cannot
-    bypass the sandbox boundary.
-    """
-    candidate = str(path or "").strip()
-    if not candidate:
-        raise ValueError("Sandbox violation: empty path is not allowed.")
-
-    if _contains_parent_traversal(candidate):
-        raise ValueError(
-            f"Sandbox violation: path uses '..' to traverse upwards: {candidate}"
-        )
-
+    cand = str(path or "").strip()
+    if not cand or _contains_parent_traversal(cand):
+        raise ValueError(f"Sandbox violation: invalid path {cand}")
     root_path = Path(ALLOWED_ROOT).resolve(strict=False)
-
-    if os.path.isabs(candidate):
-        absolute_path = Path(candidate)
-    else:
-        absolute_path = root_path / candidate
-
-    resolved_path = absolute_path.resolve(strict=False)
-    resolved_root = root_path
-
-    resolved_path_norm = os.path.normcase(str(resolved_path))
-    resolved_root_norm = os.path.normcase(str(resolved_root))
-
-    common_root = os.path.commonpath([resolved_root_norm, resolved_path_norm])
-    if common_root != resolved_root_norm:
-        raise ValueError(
-            "Sandbox violation: path resolves outside the allowed project root.\n"
-            f"Requested path: {resolved_path_norm}\n"
-            f"Allowed root:   {resolved_root_norm}"
-        )
-
-    return str(resolved_path)
+    abs_path = Path(cand) if os.path.isabs(cand) else root_path / cand
+    res_path = abs_path.resolve(strict=False)
+    res_path_norm = os.path.normcase(str(res_path))
+    res_root_norm = os.path.normcase(str(root_path))
+    if os.path.commonpath([res_root_norm, res_path_norm]) != res_root_norm:
+        raise ValueError(f"Sandbox violation: {res_path_norm} outside {res_root_norm}")
+    return str(res_path)
 
 
 def _validate_compiler_binary(command_parts: list[str]) -> str | None:
-    """Return ``None`` if the binary is allowed, or an error message."""
     if not command_parts:
         return "Empty command."
-    binary = os.path.basename(command_parts[0]).lower()
-    # Strip version suffixes (g++-12) and .exe on Windows.
-    base = re.sub(r'-\d+(\.\d+)*$', '', binary)
-    base = re.sub(r'\.exe$', '', base)
-    if base not in _ALLOWED_COMPILERS:
-        return (
-            f"Binary '{command_parts[0]}' is not in the allowed compiler whitelist: "
-            f"{sorted(_ALLOWED_COMPILERS)}"
-        )
-    return None
+    binary = re.sub(r'-\d+(\.\d+)*$', '', re.sub(r'\.exe$', '', os.path.basename(command_parts[0]).lower()))
+    return None if binary in _ALLOWED_COMPILERS else f"Binary not allowed: {sorted(_ALLOWED_COMPILERS)}"
 
 
-def _resolve_path_token(token: str, cwd: Optional[str]) -> str:
-    if os.path.isabs(token):
-        return _ensure_within_allowed_root(token)
-    base = cwd or ALLOWED_ROOT
-    return _ensure_within_allowed_root(os.path.join(base, token))
+def _resolve_path_token(token: str, cwd: str | None) -> str:
+    if not os.path.isabs(token) and cwd:
+        token = os.path.join(cwd, token)
+    return _ensure_within_allowed_root(token)
 
 
-def _validate_compiler_arguments(command_parts: list[str], cwd: Optional[str]) -> str | None:
-    """Validate compiler flags and path-bearing arguments for sandbox safety."""
-    disallowed_prefixes = (
-        "-fplugin", "-specs=", "-B", "-wrapper", "@",
-        "-Xclang", "-load",
-    )
-    path_valued_flags = {
-        "-o", "-MF", "-MT", "-MQ", "-I", "-isystem", "-imacros", "-include", "-c", "-S", "-E",
-    }
+def _validate_compiler_arguments(command_parts: list[str], cwd: str | None) -> str | None:
+    disallowed_prefixes = ("-fplugin", "-specs=", "-B", "-wrapper", "@", "-Xclang", "-load")
+    path_valued_flags = {"-o", "-MF", "-MT", "-MQ", "-I", "-isystem", "-imacros", "-include", "-c", "-S", "-E"}
 
     index = 1
     while index < len(command_parts):
@@ -380,79 +277,36 @@ def _validate_compiler_arguments(command_parts: list[str], cwd: Optional[str]) -
     return None
 
 
-def _run_compiler_safe(command_parts: list[str], cwd: Optional[str]) -> dict[str, object]:
-    """Execute compiler subprocess with shared timeout/error handling."""
+def _run_compiler_safe(command_parts: list[str], cwd: str | None) -> dict[str, object]:
     try:
-        completed_process = subprocess.run(
-            command_parts,
-            cwd=cwd or None,
-            capture_output=True,
-            text=True,
-            timeout=_RUN_COMPILER_TIMEOUT_SECONDS,
-        )
+        res = subprocess.run(command_parts, cwd=cwd, capture_output=True, text=True, timeout=_RUN_COMPILER_TIMEOUT_SECONDS)
     except FileNotFoundError:
-        return {
-            "ok": False,
-            "message": "The compiler program could not be found. Confirm the command name is installed and on your PATH.",
-            "kind": "missing-compiler",
-        }
+        return {"ok": False, "message": "Compiler not found on PATH.", "kind": "missing-compiler"}
     except subprocess.TimeoutExpired:
-        return {
-            "ok": False,
-            "message": (
-                f"Compiler execution exceeded timeout of {_RUN_COMPILER_TIMEOUT_SECONDS} seconds "
-                "and was terminated."
-            ),
-            "kind": "timeout",
-        }
-    except Exception as error:
-        return {
-            "ok": False,
-            "message": f"Unexpected problem while running the compiler: {error!r}",
-            "kind": "runtime",
-        }
-
-    return {
-        "ok": True,
-        "returncode": int(completed_process.returncode),
-        "stdout": str(completed_process.stdout or ""),
-        "stderr": str(completed_process.stderr or ""),
-    }
+        return {"ok": False, "message": f"Timeout exceeded ({_RUN_COMPILER_TIMEOUT_SECONDS}s).", "kind": "timeout"}
+    except Exception as exc:
+        return {"ok": False, "message": f"Unexpected error: {exc!r}", "kind": "runtime"}
+    return {"ok": True, "returncode": res.returncode, "stdout": str(res.stdout or ""), "stderr": str(res.stderr or "")}
 
 
 def _path_has_ignored_component(filepath: str) -> bool:
-    """Return True if any path segment belongs to ``_IGNORED_DIRS``."""
-    parts = filepath.replace("\\", "/").split("/")
-    return any(p in _IGNORED_DIRS for p in parts)
+    return any(p in _IGNORED_DIRS for p in filepath.replace("\\", "/").split("/"))
 
 
 def _tool_log(tool_name: str, detail: str) -> None:
-    """Write a concise tool-invocation log line to stderr."""
-    print(f"Tool '{tool_name}' called: {detail}", file=sys.stderr, flush=True)
+    print(f"Tool '{tool_name}': {detail}", file=sys.stderr, flush=True)
 
 
 def _truncate_text(value: str, max_chars: int) -> tuple[str, bool]:
-    """Truncate long text for safer JSON responses."""
-    if max_chars <= 0:
-        return "", bool(value)
-    if len(value) <= max_chars:
+    if max_chars <= 0 or len(value) <= max_chars:
         return value, False
     suffix = "\n...<truncated>"
-    keep = max(0, max_chars - len(suffix))
-    return value[:keep] + suffix, True
+    return value[:max(0, max_chars - len(suffix))] + suffix, True
 
-
-# ===================================================================
-# MCP tools
-# ===================================================================
 
 @mcp_server.tool()
 def read_code(file_path: str) -> str:
-    """Read the contents of a text file from the local filesystem.
-
-    Returns a JSON object with ``status``, ``content``, and ``file_path``
-    on success, or ``status`` and ``message`` on error.
-    """
+    """Read a text file from the filesystem."""
     _tool_log("read_code", f"file_path='{file_path}'")
 
     try:
@@ -482,15 +336,7 @@ def read_code(file_path: str) -> str:
 
 @mcp_server.tool()
 def write_code(file_path: str, content: str) -> str:
-    """Write text content to a file inside the sandboxed project root.
-
-    Parent directories are created automatically when they do not exist.
-
-    Truncation guard: if the target file already exists and the incoming content
-    is less than 50 % of the existing file's length, the write is refused with
-    an error so that partial/truncated LLM responses cannot silently corrupt
-    source files.
-    """
+    """Write text to a file. Detects truncation to prevent corruption."""
     _tool_log("write_code", f"file_path='{file_path}', content_len={len(content)}")
 
     try:
@@ -498,9 +344,6 @@ def write_code(file_path: str, content: str) -> str:
     except ValueError as sandbox_error:
         return _make_result("error", message=str(sandbox_error))
 
-    # ------------------------------------------------------------------
-    # Truncation safety check
-    # ------------------------------------------------------------------
     if os.path.isfile(absolute_path):
         try:
             with open(absolute_path, "r", encoding="utf-8") as _fh:
@@ -552,53 +395,27 @@ def write_code(file_path: str, content: str) -> str:
         return _make_result("error", message=f"Unexpected problem while writing the file: {error!r}")
 
 
-# ---------------------------------------------------------------------------
-# Compiler output helpers
-# ---------------------------------------------------------------------------
-
-def _extract_source_locations(text: str) -> set[tuple[str, str, Optional[str]]]:
-    """Extract file/line(/column) locations from compiler output text."""
-    locations: set[tuple[str, str, Optional[str]]] = set()
+def _extract_source_locations(text: str) -> set[tuple[str, str, str | None]]:
+    locations: set[tuple[str, str, str | None]] = set()
     if not text:
         return locations
-
-    pattern_with_column = re.compile(r"([^\s:]+):(\d+):(\d+)")
-    pattern_without_column = re.compile(r"([^\s:]+):(\d+)(?!:)")
-
-    for match in pattern_with_column.finditer(text):
+    for match in re.compile(r"([^\s:]+):(\d+)(?::(\d+))?").finditer(text):
         file_name, line, column = match.groups()
         locations.add((file_name, line, column))
-
-    for match in pattern_without_column.finditer(text):
-        file_name, line = match.groups()
-        if not any(f == file_name and l == line for (f, l, _) in locations):
-            locations.add((file_name, line, None))
-
     return locations
 
 
 def _build_location_hints(standard_output: str, error_output: str) -> list[dict]:
-    """Return structured location hints extracted from compiler output."""
-    locations = set()
-    locations.update(_extract_source_locations(error_output))
-    locations.update(_extract_source_locations(standard_output))
-
-    hints: list[dict] = []
-    for file_name, line, column in sorted(locations):
-        entry: dict = {"file": file_name, "line": int(line)}
-        if column is not None:
-            entry["column"] = int(column)
-        hints.append(entry)
-    return hints
+    locations = _extract_source_locations(error_output) | _extract_source_locations(standard_output)
+    return [
+        ({"file": file_name, "line": int(line), "column": int(column)} if column else {"file": file_name, "line": int(line)})
+        for file_name, line, column in sorted(locations)
+    ]
 
 
 @mcp_server.tool()
-def run_compiler(command: str, working_directory: Optional[str] = None) -> str:
-    """Run a local compiler command and return its result as JSON.
-
-    Only whitelisted compiler binaries are permitted and path-bearing arguments
-    are restricted to ALLOWED_ROOT.
-    """
+def run_compiler(command: str, working_directory: str | None = None) -> str:
+    """Run a compiler command (whitelisted binaries only)."""
     _tool_log(
         "run_compiler",
         f"command='{command}', working_directory='{working_directory or '.'}'",
@@ -668,7 +485,7 @@ def run_compiler(command: str, working_directory: Optional[str] = None) -> str:
     cpp_inputs = _extract_cpp_inputs_from_command(command_parts, working_directory_resolved)
     execute_result = _run_compiler_safe(command_parts, working_directory_resolved)
 
-    if not bool(execute_result.get("ok")):
+    if not execute_result.get("ok"):
         result_obj = {
             "status": "error",
             "message": str(execute_result.get("message") or "Compiler execution failed."),
@@ -678,7 +495,8 @@ def run_compiler(command: str, working_directory: Optional[str] = None) -> str:
         _MODEL_BRIDGE.end_span(span, output_payload=result_obj, level="ERROR")
         return _make_result(**result_obj)
 
-    exit_code = int(execute_result.get("returncode") or 0)
+    returncode_raw = execute_result.get("returncode")
+    exit_code = int(returncode_raw) if isinstance(returncode_raw, int) else 0
     stdout = str(execute_result.get("stdout") or "").strip()
     stderr = str(execute_result.get("stderr") or "").strip()
     hints = _build_location_hints(stdout, stderr)
@@ -704,11 +522,7 @@ def run_compiler(command: str, working_directory: Optional[str] = None) -> str:
 
 @mcp_server.tool()
 def run_binary(path: str, timeout: int = 5) -> str:
-    """Execute a compiled binary inside the sandbox and capture its output.
-
-    The binary must reside under ALLOWED_ROOT. A timeout (seconds) prevents
-    infinite loops from hanging the server.
-    """
+    """Execute a compiled binary with timeout."""
     _tool_log("run_binary", f"path='{path}', timeout={timeout}")
 
     if not _ALLOW_RUN_BINARY:
@@ -802,10 +616,7 @@ def list_directory(path: str) -> str:
     except Exception as error:
         return _make_result("error", message=f"Could not list directory contents: {error!r}")
 
-    items: list[dict] = []
-    for name in entries:
-        full = os.path.join(absolute_path, name)
-        items.append({"name": name, "type": "directory" if os.path.isdir(full) else "file"})
+    items = [{"name": name, "type": "directory" if os.path.isdir(os.path.join(absolute_path, name)) else "file"} for name in entries]
 
     return _make_result(
         "success",
@@ -816,11 +627,7 @@ def list_directory(path: str) -> str:
 
 @mcp_server.tool()
 def list_tree(path: str, depth: int = 2) -> str:
-    """Render a visual directory tree from a path inside the sandbox.
-
-    Directories in ``_IGNORED_DIRS`` (node_modules, .git, build,
-    vcpkg_installed, ...) are skipped automatically to avoid noise.
-    """
+    """Render a directory tree (ignored dirs skipped)."""
     _tool_log("list_tree", f"path='{path}', depth={depth}")
 
     target = path or "."
@@ -836,8 +643,7 @@ def list_tree(path: str, depth: int = 2) -> str:
     root_display = os.path.relpath(absolute_path, ALLOWED_ROOT)
     if root_display == ".":
         root_display = os.path.basename(ALLOWED_ROOT) or ALLOWED_ROOT
-
-    lines: list[str] = [f"Tree for {root_display} (depth={max_depth}):"]
+    lines = [f"Tree for {root_display} (depth={max_depth}):"]
 
     def _walk(current_path: str, prefix: str, current_depth: int) -> None:
         if current_depth >= max_depth:
@@ -848,11 +654,7 @@ def list_tree(path: str, depth: int = 2) -> str:
             lines.append(f"{prefix}[ERROR] {error!r}")
             return
 
-        # Filter ignored directories.
-        entries = [
-            e for e in entries
-            if not (os.path.isdir(os.path.join(current_path, e)) and e in _IGNORED_DIRS)
-        ]
+        entries = [e for e in entries if not (os.path.isdir(os.path.join(current_path, e)) and e in _IGNORED_DIRS)]
 
         for index, entry in enumerate(entries):
             full_path = os.path.join(current_path, entry)
@@ -873,11 +675,7 @@ def list_tree(path: str, depth: int = 2) -> str:
 
 @mcp_server.tool()
 def search_code(query: str, file_pattern: str = "*") -> str:
-    """Search text across project files using glob + regex.
-
-    Directories in ``_IGNORED_DIRS`` are automatically excluded.
-    Returns a JSON object with ``matches`` and metadata.
-    """
+    """Search files for a regex pattern."""
     _tool_log("search_code", f"query='{query}', file_pattern='{file_pattern}'")
 
     if not query:
@@ -892,17 +690,15 @@ def search_code(query: str, file_pattern: str = "*") -> str:
     glob_pattern = os.path.join(ALLOWED_ROOT, "**", pattern)
     candidate_paths = glob.glob(glob_pattern, recursive=True)
 
-    files: list[str] = []
+    files = []
     for matched in candidate_paths:
-        if not os.path.isfile(matched):
-            continue
-        if _path_has_ignored_component(matched):
+        if not os.path.isfile(matched) or _path_has_ignored_component(matched):
             continue
         try:
             _ensure_within_allowed_root(matched)
+            files.append(matched)
         except ValueError:
             continue
-        files.append(matched)
 
     files = sorted(set(files))
     total_candidate_files = len(files)
@@ -970,11 +766,8 @@ def get_file_info(file_path: str) -> str:
         stat_info = os.stat(absolute_path)
         size_bytes = stat_info.st_size
         modified_iso = datetime.fromtimestamp(stat_info.st_mtime).isoformat()
-
-        line_count = 0
         with open(absolute_path, "r", encoding="utf-8") as handle:
-            for _ in handle:
-                line_count += 1
+            line_count = sum(1 for _ in handle)
 
         return _make_result(
             "success",
@@ -991,10 +784,6 @@ def get_file_info(file_path: str) -> str:
     except Exception as error:
         return _make_result("error", message=f"Unexpected problem while gathering file info: {error!r}")
 
-
-# ===================================================================
-# Helpers for get_context_for_function
-# ===================================================================
 
 _PRIMITIVE_TYPES: set[str] = {
     "int", "float", "double", "char", "bool", "void", "long", "short",
@@ -1108,170 +897,87 @@ def _extract_candidate_type_names(text: str) -> list[str]:
 
 
 def _strip_cpp_comments_and_strings(source_code: str) -> str:
-    """Remove comments and string literals to reduce regex false positives."""
-    without_block_comments = re.sub(r"/\*.*?\*/", "", source_code, flags=re.DOTALL)
-    without_line_comments = re.sub(r"//[^\n]*", "", without_block_comments)
-    without_strings = re.sub(r'"(?:\\.|[^"\\])*"', '""', without_line_comments)
-    without_char_literals = re.sub(r"'(?:\\.|[^'\\])*'", "''", without_strings)
-    return without_char_literals
+    code = re.sub(r"/\*.*?\*/", "", source_code, flags=re.DOTALL)
+    code = re.sub(r"//[^\n]*", "", code)
+    code = re.sub(r'"(?:\\.|[^"\\])*"', '""', code)
+    return re.sub(r"'(?:\\.|[^'\\])*'", "''", code)
 
 
 def _classify_ownership(source_code: str) -> list[str]:
-    """Infer ownership / lifecycle notes from a type's source code.
-
-    Detects Rule of Five compliance, move semantics, swap idiom,
-    C++20 non-owning views, concepts, and coroutine types.
-    """
-    hints: list[str] = []
+    hints = []
     code = _strip_cpp_comments_and_strings(source_code)
-
-    # --- Rule of Five analysis ---
     has_dtor = bool(re.search(r'~\w+\s*\(', code))
     has_copy_ctor = bool(re.search(r'\w+\s*\(\s*const\s+\w+\s*&\s*[),]', code))
     has_copy_assign = bool(re.search(r'operator\s*=\s*\(\s*const\s+\w+\s*&', code))
     has_move_ctor = bool(re.search(r'\w+\s*\(\s*\w+\s*&&\s*[),]', code))
     has_move_assign = bool(re.search(r'operator\s*=\s*\(\s*\w+\s*&&', code))
-    has_deleted = bool(re.search(r'=\s*delete', code))
-
     r5_count = sum([has_dtor, has_copy_ctor, has_copy_assign, has_move_ctor, has_move_assign])
-
-    if has_deleted:
-        if re.search(r'\b(operator\s*=|\w+\s*\(\s*const\s+\w+\s*&)', code):
-            hints.append("non-copyable (copy constructor or assignment deleted)")
-        else:
-            hints.append("has explicitly deleted special member(s)")
-
+    if re.search(r'=\s*delete', code):
+        hints.append("has deleted member(s)")
     if r5_count >= 5:
-        hints.append("Rule of Five compliant (all five special members defined)")
+        hints.append("Rule of Five compliant")
     elif r5_count >= 3:
-        hints.append(f"Rule of Five partially implemented ({r5_count}/5 special members)")
-
+        hints.append(f"Rule of Five partial ({r5_count}/5)")
     if has_move_ctor or has_move_assign:
         hints.append("supports move semantics")
-
-    # Swap idiom.
     if re.search(r'\bswap\s*\(', code):
-        hints.append("implements swap idiom")
-
-    # Exclusive ownership.
+        hints.append("implements swap")
     if re.search(r'\bstd::unique_ptr\b', code):
-        hints.append("owns exclusive resource via std::unique_ptr -- not copyable by default")
-
-    # Shared ownership.
+        hints.append("unique_ptr (exclusive)")
     if re.search(r'\bstd::shared_ptr\b', code):
-        hints.append("shares ownership via std::shared_ptr")
-
-    # Polymorphic base.
+        hints.append("shared_ptr (shared)")
     if re.search(r'\bvirtual\b', code):
-        hints.append("polymorphic (has virtual method(s)); prefer pointer/reference semantics")
-
-    # Explicit destructor without move (resource managed manually).
+        hints.append("polymorphic")
     if has_dtor and not has_move_ctor and not has_move_assign:
-        hints.append("manages resources (explicit destructor, no move support)")
-
-    # C++20: Non-owning views.
+        hints.append("manages resources")
     if re.search(r'\bstd::span\b', code):
-        hints.append("uses std::span (non-owning contiguous view)")
+        hints.append("std::span (non-owning)")
     if re.search(r'\bstd::string_view\b', code):
-        hints.append("uses std::string_view (non-owning string reference)")
-
-    # C++20: Concepts and constraints.
+        hints.append("string_view (non-owning)")
     if re.search(r'\brequires\b', code):
-        hints.append("C++20 constrained (uses requires clause)")
+        hints.append("C++20 constrained")
     if re.search(r'\bconcept\b', code):
-        hints.append("defines or uses C++20 concept")
-
-    # C++20: Coroutines.
+        hints.append("C++20 concept")
     if re.search(r'\bco_await\b|\bco_yield\b|\bco_return\b', code):
-        hints.append("C++20 coroutine type (uses co_await/co_yield/co_return)")
+        hints.append("C++20 coroutine")
+    return hints if hints else ["standard value semantics"]
 
-    return hints if hints else ["standard value semantics (copyable and movable)"]
 
-
-def _collect_type_bundle(
-    seed_type_names: list[str],
-    type_definitions: dict[str, str],
-    types_meta: list[dict],
-) -> dict[str, dict]:
-    """Recursively resolve *seed_type_names* and all their base classes.
-
-    Returns ``{type_name: {source_code, bases, ownership_hints}}``.
-    """
-    name_to_meta: dict[str, dict] = {}
-    for t in types_meta:
-        n = str(t.get("name") or "")
-        if n:
-            name_to_meta[n] = t
-
-    bundle: dict[str, dict] = {}
-    queue = list(seed_type_names)
-    visited: set[str] = set()
-
+def _collect_type_bundle(seed_type_names: list[str], type_definitions: dict[str, str], types_meta: list[dict]) -> dict[str, dict]:
+    name_to_meta = {str(t.get("name") or ""): t for t in types_meta if t.get("name")}
+    bundle, queue, visited = {}, list(seed_type_names), set()
     while queue:
         type_name = queue.pop(0)
         if type_name in visited:
             continue
         visited.add(type_name)
-
         source_code = type_definitions.get(type_name)
-        if source_code is None:
+        if not source_code:
             continue
-
         meta = name_to_meta.get(type_name, {})
         bases = [str(b) for b in (meta.get("bases") or [])]
-        ownership_hints = _classify_ownership(source_code)
-
-        bundle[type_name] = {
-            "source_code": source_code,
-            "bases": bases,
-            "ownership_hints": ownership_hints,
-        }
-
+        bundle[type_name] = {"source_code": source_code, "bases": bases, "ownership_hints": _classify_ownership(source_code)}
         queue.extend(b for b in bases if b not in visited)
-
     return bundle
 
 
 def _summarize_type_definition(source_code: str) -> str:
-    """Return a compact type-definition summary for prompt-size control."""
     if _TYPE_BUNDLE_INCLUDE_FULL_SOURCE:
         return source_code
-
-    compact = _strip_cpp_comments_and_strings(source_code)
-    compact = re.sub(r"\n{3,}", "\n\n", compact).strip()
-
+    compact = re.sub(r"\n{3,}", "\n\n", _strip_cpp_comments_and_strings(source_code)).strip()
     brace_index = compact.find("{")
     if brace_index == -1:
-        truncated, was_truncated = _truncate_text(compact, _TYPE_BUNDLE_MAX_DEF_CHARS)
-        if was_truncated:
-            truncated += "\n// <type definition truncated>"
-        return truncated
-
-    header_part = compact[: brace_index + 1]
-    body_part = compact[brace_index + 1:]
-    body_lines = [ln.strip() for ln in body_part.splitlines() if ln.strip()]
+        truncated, truncated_flag = _truncate_text(compact, _TYPE_BUNDLE_MAX_DEF_CHARS)
+        return truncated + ("\n// <truncated>" if truncated_flag else "")
+    header = compact[: brace_index + 1]
+    body_lines = [ln.strip() for ln in compact[brace_index + 1:].splitlines() if ln.strip()]
     member_lines = [ln for ln in body_lines if ln.endswith(";")][:12]
-
-    summary = header_part + "\n"
-    if member_lines:
-        summary += "\n".join(member_lines)
-    summary += "\n};"
-
-    truncated, was_truncated = _truncate_text(summary, _TYPE_BUNDLE_MAX_DEF_CHARS)
-    if was_truncated:
-        truncated += "\n// <type summary truncated>"
-    return truncated
+    summary = header + "\n" + ("\n".join(member_lines) if member_lines else "") + "\n};"
+    truncated, truncated_flag = _truncate_text(summary, _TYPE_BUNDLE_MAX_DEF_CHARS)
+    return truncated + ("\n// <truncated>" if truncated_flag else "")
 
 
-def _format_type_bundle(
-    bundle: dict[str, dict],
-    header_paths: dict[str, str] | None = None,
-) -> str:
-    """Render the type bundle as a structured, LLM-readable section.
-
-    When *header_paths* is supplied, each type entry includes the relative
-    file path where the type was defined.
-    """
+def _format_type_bundle(bundle: dict[str, dict], header_paths: dict[str, str] | None = None) -> str:
     if not bundle:
         return ""
 
@@ -1294,10 +1000,6 @@ def _format_type_bundle(
 
     return "\n".join(lines)
 
-
-# ===================================================================
-# Global cross-file type resolution cache (incremental + threaded)
-# ===================================================================
 
 class _GlobalProjectMapCache:
     """Lazily scans all C++ source / header files under ALLOWED_ROOT.
@@ -1350,7 +1052,7 @@ class _GlobalProjectMapCache:
     def _touch_file_access(self, filepath: str) -> None:
         self._file_last_access[filepath] = time.time()
 
-    def _index_file(self, parser: "CppParser", filepath: str) -> None:
+    def _index_file(self, parser: Any, filepath: str) -> None:
         try:
             pm = parser.parse_file(filepath, workspace_root=ALLOWED_ROOT)
             _index_project_map_in_rag(pm, source=filepath)
@@ -1389,12 +1091,10 @@ class _GlobalProjectMapCache:
             self._enforce_cache_bounds()
 
     def _enforce_cache_bounds(self) -> None:
-        """Bound memory growth by capping retained type-definition entries."""
         current_size = len(self._type_definitions)
         if current_size <= _GLOBAL_CACHE_MAX_TYPES:
             return
 
-        # Evict least-recently-used files first based on access time.
         by_age = sorted(self._file_last_access.items(), key=lambda item: item[1])
         while len(self._type_definitions) > _GLOBAL_CACHE_MAX_TYPES and by_age:
             stale_file, _mtime = by_age.pop(0)
@@ -1412,8 +1112,6 @@ class _GlobalProjectMapCache:
             self._file_last_access.pop(stale_file, None)
             self._stale_files.discard(stale_file)
 
-    # --- Build methods ------------------------------------------------------
-
     def _build(self) -> None:
         with self._data_lock:
             if self._building:
@@ -1427,7 +1125,7 @@ class _GlobalProjectMapCache:
                     self._built = True
                 return
 
-            parser = CppParser()
+            parser = _new_cpp_parser()
             extensions = ("*.cpp", "*.cc", "*.cxx", "*.h", "*.hpp", "*.hxx")
             for ext in extensions:
                 pattern = os.path.join(ALLOWED_ROOT, "**", ext)
@@ -1440,7 +1138,6 @@ class _GlobalProjectMapCache:
                     if should_index:
                         self._index_file(parser, filepath)
 
-            # Remove files that no longer exist.
             with self._data_lock:
                 missing_files = [p for p in self._file_mtimes if not os.path.exists(p)]
                 for stale_file in missing_files:
@@ -1464,7 +1161,6 @@ class _GlobalProjectMapCache:
                 self._build_event.set()
 
     def build_in_background(self) -> threading.Thread:
-        """Launch a daemon thread that builds the cache without blocking."""
         with self._data_lock:
             if self._building:
                 if self._build_thread is not None:
@@ -1497,12 +1193,9 @@ class _GlobalProjectMapCache:
             return
         self._build()
 
-    # --- Query methods ------------------------------------------------------
-
     def lookup_types(
         self, type_names: list[str],
     ) -> tuple[dict[str, str], list[dict]]:
-        """Return (type_definitions, types_meta) for the requested names."""
         self.ensure_built()
         with self._data_lock:
             matched_defs = {
@@ -1525,7 +1218,6 @@ class _GlobalProjectMapCache:
         return matched_defs, matched_meta
 
     def get_header_path(self, type_name: str) -> str:
-        """Return the workspace-relative path where *type_name* is defined."""
         self.ensure_built()
         with self._data_lock:
             filepath = self._type_to_file.get(type_name, "")
@@ -1536,7 +1228,6 @@ class _GlobalProjectMapCache:
         return ""
 
     def get_include_graph_for_file(self, filepath: str) -> dict[str, str | None]:
-        """Return ``{include_directive: resolved_path | None}`` for *filepath*."""
         self.ensure_built()
         with self._data_lock:
             raw_headers = list(self._include_graph.get(filepath, []))
@@ -1554,7 +1245,6 @@ class _GlobalProjectMapCache:
         return result
 
     def _resolve_header(self, header_ref: str, file_dir: str) -> str | None:
-        """Try to resolve a header ref like ``"foo.h"`` or ``<bar.hpp>`` to a real path."""
         if header_ref.startswith('"') and header_ref.endswith('"'):
             bare = header_ref.strip('"')
             candidate = os.path.normpath(os.path.join(file_dir, bare))
@@ -1571,7 +1261,6 @@ class _GlobalProjectMapCache:
         return None
 
     def invalidate(self) -> None:
-        """Force a full rescan on next access."""
         with self._data_lock:
             self._type_definitions.clear()
             self._types_meta.clear()
@@ -1586,23 +1275,18 @@ class _GlobalProjectMapCache:
             self._build_event.clear()
 
     def invalidate_file(self, filepath: str, reparse_now: bool = False) -> None:
-        """Mark one file stale and optionally re-index it immediately."""
         with self._data_lock:
             self._stale_files.add(filepath)
             self._built = False
         if reparse_now and _PARSER_AVAILABLE and os.path.isfile(filepath):
             try:
-                parser = CppParser()
+                parser = _new_cpp_parser()
                 self._index_file(parser, filepath)
                 with self._data_lock:
                     self._built = True
             except Exception as exc:
                 logger.warning("Cache reparse failed for '%s': %r", filepath, exc)
 
-
-# ===================================================================
-# MCP tools -- semantic / contextual
-# ===================================================================
 
 @mcp_server.tool()
 def get_context_for_function(file_path: str, function_fqn: str) -> str:
@@ -1654,7 +1338,6 @@ def get_context_for_function(file_path: str, function_fqn: str) -> str:
         _MODEL_BRIDGE.end_span(span, output_payload=_result_to_dict(result), level="ERROR")
         return result
 
-    # Keep cache freshness for this file deterministic after recent writes.
     _GlobalProjectMapCache.get().invalidate_file(absolute_path, reparse_now=True)
 
     source_text = _read_text_if_exists(absolute_path)
@@ -1678,7 +1361,7 @@ def get_context_for_function(file_path: str, function_fqn: str) -> str:
         )
 
     try:
-        parser = CppParser()
+        parser = _new_cpp_parser()
         project_map = parser.parse_file(absolute_path, workspace_root=ALLOWED_ROOT)
         _index_project_map_in_rag(project_map, source=absolute_path)
     except Exception as exc:
@@ -1736,7 +1419,6 @@ def get_context_for_function(file_path: str, function_fqn: str) -> str:
         return result
     called_signatures: dict = base_context.get("called_function_signatures") or {}
 
-    # Collect seed type names from parameters + signature + body.
     parameters: list = fn_meta.get("parameters") or []
     param_type_text = " ".join(str(p.get("type") or "") for p in parameters)
     seed_candidates = _extract_candidate_type_names(
@@ -1748,7 +1430,6 @@ def get_context_for_function(file_path: str, function_fqn: str) -> str:
 
     seed_types = [t for t in seed_candidates if t in type_definitions]
 
-    # Cross-file resolution: look up types not found locally.
     unresolved = [t for t in seed_candidates if t not in type_definitions]
     if unresolved:
         global_cache = _GlobalProjectMapCache.get()
@@ -1765,7 +1446,6 @@ def get_context_for_function(file_path: str, function_fqn: str) -> str:
 
     type_bundle = _collect_type_bundle(seed_types, merged_defs, merged_meta)
 
-    # Build header_path map for every type in the bundle.
     global_cache = _GlobalProjectMapCache.get()
     header_paths: dict[str, str] = {}
     for type_name in type_bundle:
@@ -1773,7 +1453,6 @@ def get_context_for_function(file_path: str, function_fqn: str) -> str:
         if hp:
             header_paths[type_name] = hp
 
-    # --- Format human-readable output sections ---
     sections: list[str] = []
     sections.append(f"=== FUNCTION CONTEXT: {function_fqn} ===")
     sections.append(f"\nSignature:\n{signature}")
@@ -1841,16 +1520,14 @@ def get_include_graph(file_path: str) -> str:
     if not os.path.isfile(absolute_path):
         return _make_result("error", message=f"File not found: {absolute_path}")
 
-    # Ensure the global cache is built so header resolution can use it.
     global_cache = _GlobalProjectMapCache.get()
     global_cache.ensure_built()
 
     graph = global_cache.get_include_graph_for_file(absolute_path)
 
-    # If the file was not yet indexed (e.g. just created), parse it ad-hoc.
     if not graph:
         try:
-            parser = CppParser()
+            parser = _new_cpp_parser()
             pm = parser.parse_file(absolute_path, workspace_root=ALLOWED_ROOT)
             _index_project_map_in_rag(pm, source=absolute_path)
             headers = pm.get("headers") or []
@@ -1966,7 +1643,7 @@ def add_header_to_file(file_path: str, header_name: str, force: bool = False) ->
 
 @mcp_server.tool()
 def get_compilation_errors(
-    command: str, working_directory: Optional[str] = None,
+    command: str, working_directory: str | None = None,
 ) -> str:
     """Run a compiler command and return a JSON object with structured diagnostics."""
     _tool_log(
@@ -2018,7 +1695,8 @@ def get_compilation_errors(
             errors=[{"file": "<runtime>", "line": 0, "error_message": str(run_result.get("message") or "Execution failed")}],
         )
 
-    return_code = int(run_result.get("returncode") or 0)
+    returncode_raw = run_result.get("returncode")
+    return_code = int(returncode_raw) if isinstance(returncode_raw, int) else 0
     stdout_text = str(run_result.get("stdout") or "")
     stderr_text = str(run_result.get("stderr") or "")
 

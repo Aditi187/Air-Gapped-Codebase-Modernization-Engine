@@ -1,42 +1,51 @@
-#include <algorithm>
 #include <iostream>
-#include <optional>
 #include <string>
-#include <string_view>
+#include <vector>
+#include <memory>
 
-std::string GLOBAL_LOG_BUFFER;
-
-struct LegacyRecord {
-    int id{};
-    std::string raw_data;
-    std::size_t len{};
+class Shape {
+public:
+    std::string color;
+    Shape(const std::string& c) : color(c) {}
+    virtual ~Shape() = default;
+    virtual void draw() = 0;
 };
 
-std::optional<LegacyRecord> load_record(int id) {
-    if (id <= 0) {
-        return std::nullopt;
+class Circle : public Shape {
+public:
+    Circle(const std::string& c) : Shape(c) {}
+    void draw() override {
+        std::cout << "Drawing Circle (" << color << ")" << std::endl;
     }
+};
 
-    constexpr std::string_view kRawData{"DEVICE_DATA_STREAM_0xCF"};
-
-    LegacyRecord record{};
-    record.id = id;
-    record.raw_data.assign(kRawData.begin(), kRawData.end());
-    record.len = record.raw_data.size();
-
-    return record;
-}
-
-void process_data() {
-    const auto rec = load_record(42);
-    if (rec.has_value()) {
-        std::cout << "Processing Record " << rec->id << ": " << rec->raw_data << "\n";
-        return;
+class Rectangle : public Shape {
+public:
+    Rectangle(const std::string& c) : Shape(c) {}
+    void draw() override {
+        std::cout << "Drawing Rectangle (" << color << ")" << std::endl;
     }
-    std::cout << "Failed to load record.\n";
-}
+};
+
+class ShapeList {
+public:
+    std::vector<std::unique_ptr<Shape>> shapes;
+    ShapeList() = default;
+    ~ShapeList() = default;
+    void add(std::unique_ptr<Shape> s) {
+        shapes.push_back(std::move(s));
+    }
+    void drawAll() const {
+        for (const auto& shape : shapes) {
+            shape->draw();
+        }
+    }
+};
 
 int main() {
-    process_data();
+    ShapeList list;
+    list.add(std::make_unique<Circle>("Red"));
+    list.add(std::make_unique<Rectangle>("Blue"));
+    list.drawAll();
     return 0;
 }

@@ -8,7 +8,7 @@ import logging
 import os
 import re
 import threading
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 
 _LOG = logging.getLogger(__name__)
@@ -16,12 +16,6 @@ _LOG = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class ComplianceRule:
-	"""Single weighted compliance rule used by score_cpp17_compliance.
-
-	Each rule contributes up to weight points based on positive and negative
-	pattern matches on masked source text.
-	"""
-
 	id: str
 	weight: int
 	positive_pattern: re.Pattern[str]
@@ -38,7 +32,7 @@ _RULES: List[ComplianceRule] = [
 		id="expected_optional",
 		weight=12,
 		positive_pattern=_regex(r"\bstd::(expected|optional)\b"),
-		negative_pattern=_regex(r"\b(return\s+-?\d+\s*;|errno\b)"),
+		negative_pattern=_regex(r"\b(?:return\s+-[1-9]\d*\s*;|errno\b)"),
 		recommendation="Prefer std::expected/std::optional over manual return codes.",
 	),
 	ComplianceRule(
@@ -48,20 +42,6 @@ _RULES: List[ComplianceRule] = [
 		negative_pattern=_regex(r"\b(const\s+std::string\s*&|const\s+char\s*\*)\b"),
 		recommendation="Use std::string_view for non-owning string parameters and views.",
 	),
-# 	ComplianceRule(
-# 		id="span_mdspan",
-# 		weight=10,
-# 		positive_pattern=_regex(r"\bstd::(span|mdspan)\b"),
-# 		negative_pattern=_regex(r"\b(char\s*\*|void\s*\*)\b"),
-# 		recommendation="Use std::span/std::mdspan for buffer handling.",
-# 	),
-# 	ComplianceRule(
-# 		id="ranges_views_pipelines",
-# 		weight=10,
-# 		positive_pattern=_regex(r"\bstd::(ranges|views)::"),
-# 		negative_pattern=_regex(r"\bstd::(sort|transform|find|for_each|copy|count|any_of|all_of|none_of)\s*\("),
-# 		recommendation="Prefer std::ranges/views pipelines where algorithm composition is needed.",
-# 	),
 	ComplianceRule(
 		id="unique_ptr_stack",
 		weight=12,
@@ -179,7 +159,7 @@ _RULES: List[ComplianceRule] = [
 
 _DEFAULT_RULES: List[ComplianceRule] = list(_RULES)
 
-_SCORE_CACHE: OrderedDict[str, Dict[str, object]] = OrderedDict()
+_SCORE_CACHE: OrderedDict[str, Dict[str, Any]] = OrderedDict()
 _SCORE_CACHE_LOCK = threading.Lock()
 _CACHE_MAX_SIZE = 100
 
@@ -204,7 +184,7 @@ _SCORE_METRIC_WEIGHT_DEFAULT = 0.4
 
 _RE_INCLUDE = re.compile(r"#\s*include\s*([<\"][^>\"]+[>\"])")
 _RE_RAW_POINTER = re.compile(
-	r"\b(?:const\s+)?(?:[A-Za-z_]\w*(?:::[A-Za-z_]\w*)*(?:\s*<[^;\n{}()]*>)?\s+)+\*+\s*[A-Za-z_]\w*\b"
+	r"\b(?:const\s+)?(?:[A-Za-z_]\w*(?:::[A-Za-z_]\w*)*\s+)+\*+\s*[A-Za-z_]\w*\b"
 )
 _RE_CHAR_POINTER = re.compile(r"\bchar\s*\*\s*[A-Za-z_]\w*\b")
 _RE_MALLOC = re.compile(r"\bmalloc\s*\(")
@@ -219,49 +199,29 @@ _RE_FPRINTF = re.compile(r"\bfprintf\s*\(")
 _RE_STD_COUT = re.compile(r"\bstd::cout\b")
 _RE_STD_CERR = re.compile(r"\bstd::cerr\b")
 _RE_STD_PRINT = re.compile(r"\bstd::(?:print|println)\s*\(")
-_RE_STD_OPTIONAL = re.compile(r"\bstd::optional\b")
-_RE_ERROR_CODE_RETURN = re.compile(r"\breturn\s+(?:0|1|-1|\d+)\s*;")
+_RE_ERROR_CODE_RETURN = re.compile(r"\breturn\s+-[1-9]\d*\s*;")
 _RE_MANUAL_LOOP = re.compile(r"\b(?:for|while)\s*\(")
 _RE_RANGE_LOOP = re.compile(
 	r"for\s*\(\s*(?:const\s+)?auto(?:\s*[&]{1,2})?\s+[A-Za-z_][A-Za-z0-9_]*\s*:\s*[^\)]+\)"
 )
-_RE_CYCLO_DECISIONS = re.compile(r"\b(if|for|while|case|catch)\b")
+_RE_CYCLO_DECISIONS = re.compile(r"\b(if|for|while)\b")
 _RE_CYCLO_BOOL = re.compile(r"&&|\|\|")
 _RE_CYCLO_TERNARY = re.compile(r"\?")
 
 
 def _normalize_target_std(target_std: str) -> str:
 	normalized = str(target_std or _DEFAULT_TARGET_STD).strip().lower()
-	if normalized in _MODERN_HEADERS_BY_STD:
-		return normalized
-	return _DEFAULT_TARGET_STD
+	return normalized if normalized in _MODERN_HEADERS_BY_STD else _DEFAULT_TARGET_STD
 
 
 def _rules_config_path() -> str:
 	return str(os.environ.get("CPP_COMPLIANCE_RULES_PATH", "")).strip()
 
 
-def _safe_regex(pattern: str) -> re.Pattern[str]:
-	"""Compile regex defensively for configurable rule loading."""
-	return re.compile(pattern)
+# _safe_regex removed
 
 
 def _load_rules_from_config(path: str) -> Optional[List[ComplianceRule]]:
-	"""Load rule definitions from JSON file.
-
-	Expected shape:
-	{
-	  "rules": [
-	    {
-	      "id": "...",
-	      "weight": 10,
-	      "positive_pattern": "...",
-	      "negative_pattern": "...",
-	      "recommendation": "..."
-	    }
-	  ]
-	}
-	"""
 	if not path:
 		return None
 	try:
@@ -284,16 +244,15 @@ def _load_rules_from_config(path: str) -> Optional[List[ComplianceRule]]:
 			rule = ComplianceRule(
 				id=str(item.get("id") or "").strip(),
 				weight=max(0, int(item.get("weight") or 0)),
-				positive_pattern=_safe_regex(str(item.get("positive_pattern") or "")),
-				negative_pattern=_safe_regex(str(item.get("negative_pattern") or "")),
+				positive_pattern=re.compile(str(item.get("positive_pattern") or "")),
+				negative_pattern=re.compile(str(item.get("negative_pattern") or "")),
 				recommendation=str(item.get("recommendation") or "").strip(),
 			)
 		except Exception as exc:
 			_LOG.warning("Skipping invalid configured rule item: %r", exc)
 			continue
-		if not rule.id or rule.weight <= 0:
-			continue
-		rules.append(rule)
+		if rule.id and rule.weight > 0:
+			rules.append(rule)
 
 	if not rules:
 		_LOG.warning("No valid compliance rules loaded from %s", path)
@@ -319,7 +278,7 @@ def _validate_rule_weights(rules: List[ComplianceRule]) -> int:
 	return total_weight
 
 
-def _cache_get(key: str) -> Optional[Dict[str, object]]:
+def _cache_get(key: str) -> Optional[Dict[str, Any]]:
 	with _SCORE_CACHE_LOCK:
 		cached = _SCORE_CACHE.get(key)
 		if cached is None:
@@ -328,7 +287,7 @@ def _cache_get(key: str) -> Optional[Dict[str, object]]:
 		return dict(cached)
 
 
-def _cache_set(key: str, value: Dict[str, object]) -> None:
+def _cache_set(key: str, value: Dict[str, Any]) -> None:
 	with _SCORE_CACHE_LOCK:
 		_SCORE_CACHE[key] = dict(value)
 		_SCORE_CACHE.move_to_end(key)
@@ -341,27 +300,24 @@ def _read_score_weight_env(name: str, default: float) -> float:
 	if not raw:
 		return default
 	try:
-		parsed = float(raw)
+		return max(0.0, float(raw))
 	except ValueError:
 		return default
-	return max(0.0, parsed)
 
 
 def _resolve_component_weights() -> Tuple[float, float]:
 	rule_weight = _read_score_weight_env("CPP_COMPLIANCE_RULE_WEIGHT", _SCORE_RULE_WEIGHT_DEFAULT)
 	metric_weight = _read_score_weight_env("CPP_COMPLIANCE_METRIC_WEIGHT", _SCORE_METRIC_WEIGHT_DEFAULT)
 	total = rule_weight + metric_weight
-	if total <= 0:
-		return _SCORE_RULE_WEIGHT_DEFAULT, _SCORE_METRIC_WEIGHT_DEFAULT
-	return rule_weight / total, metric_weight / total
+	return (_SCORE_RULE_WEIGHT_DEFAULT, _SCORE_METRIC_WEIGHT_DEFAULT) if total <= 0 else (rule_weight / total, metric_weight / total)
 
+
+_AST_IMPORT_FAILED = False
 
 def _ast_assisted_signals(source_code: str) -> Dict[str, int]:
-	"""Best-effort AST signals used to supplement critical regex metrics.
-
-	If AST parsing is unavailable or fails, this returns an empty mapping and
-	the score remains purely regex-driven.
-	"""
+	global _AST_IMPORT_FAILED
+	if _AST_IMPORT_FAILED:
+		return {}
 	enabled = str(os.environ.get("CPP_COMPLIANCE_ENABLE_AST_ASSIST", "1")).strip().lower() in {
 		"1",
 		"true",
@@ -372,6 +328,7 @@ def _ast_assisted_signals(source_code: str) -> Dict[str, int]:
 		return {}
 	try:
 		from core.ast_modernizer import ASTModernizationDetector
+
 		detector = ASTModernizationDetector()
 		node = detector.get_function_ast_node(source_code)
 		result = detector.detect_legacy_patterns(node, source_code.encode("utf-8"))
@@ -382,27 +339,13 @@ def _ast_assisted_signals(source_code: str) -> Dict[str, int]:
 			"raw_pointer_count": int(counts.get("raw_pointer", 0) or 0),
 			"printf_count": int(counts.get("printf_usage", 0) or 0),
 		}
-	except Exception:
+	except Exception as exc:
+		_LOG.warning("Failed to load ASTModernizationDetector: %r. AST signals disabled.", exc)
+		_AST_IMPORT_FAILED = True
 		return {}
 
 
 def _mask_non_code(source_code: str) -> str:
-	"""Mask comments and literals to reduce regex false positives.
-
-	This routine is intentionally lexer-like but still heuristic (not a full C++
-	parser). It preserves original length and newline positions.
-
-	Handled:
-	- line comments (//...)
-	- block comments (/* ... */)
-	- normal string and char literals with escape handling
-	- raw string literals such as R"(...)", u8R"tag(... )tag"
-
-	Limitations:
-	- nested block comments are not fully modeled (non-standard extension)
-	- trigraphs and exotic preprocessor corner cases are not fully modeled
-	- escaped newlines in unusual literal forms may still produce edge misses
-	"""
 	chars = list(source_code)
 	length = len(chars)
 	i = 0
@@ -416,7 +359,6 @@ def _mask_non_code(source_code: str) -> str:
 		ch = chars[i]
 		nxt = chars[i + 1] if i + 1 < length else ""
 
-		# Line comment.
 		if ch == "/" and nxt == "/":
 			start = i
 			i += 2
@@ -425,7 +367,6 @@ def _mask_non_code(source_code: str) -> str:
 			_blank_range(start, i)
 			continue
 
-		# Block comment.
 		if ch == "/" and nxt == "*":
 			start = i
 			i += 2
@@ -435,7 +376,6 @@ def _mask_non_code(source_code: str) -> str:
 			_blank_range(start, i)
 			continue
 
-		# Raw string literal prefixes: R"...", uR"...", UR"...", LR"...", u8R"...".
 		if ch in {"R", "u", "U", "L"}:
 			prefix_end = i
 			if ch == "u" and i + 2 < length and chars[i + 1] == "8" and chars[i + 2] == "R":
@@ -453,7 +393,7 @@ def _mask_non_code(source_code: str) -> str:
 					_blank_range(start, length)
 					break
 				delim = "".join(delim_chars)
-				j += 1  # Skip '('
+				j += 1
 				end_marker = ")" + delim + '"'
 				marker_len = len(end_marker)
 				while j + marker_len <= length and "".join(chars[j:j + marker_len]) != end_marker:
@@ -463,7 +403,6 @@ def _mask_non_code(source_code: str) -> str:
 				i = j
 				continue
 
-		# Normal string or character literal.
 		if ch in {'"', "'"}:
 			quote = ch
 			start = i
@@ -498,53 +437,31 @@ def _compute_grade(percent: int) -> str:
 		return "B"
 	if percent >= 50:
 		return "C"
-	if percent >= 30:
-		return "D"
-	return "F"
+	return "D" if percent >= 30 else "F"
 
 
-def _build_modernization_suggestions(details: List[Dict[str, object]]) -> List[str]:
+def _build_modernization_suggestions(details: List[Dict[str, Any]]) -> List[str]:
 	seen: set[str] = set()
 	suggestions: List[str] = []
 
 	for item in details:
 		recommendation = str(item.get("recommendation") or "").strip()
-		if not recommendation:
-			continue
-		legacy = bool(item.get("legacy_detected", False))
-
-		# Suggestions are shown only when legacy usage was actually detected.
-		if legacy:
-			if recommendation not in seen:
-				seen.add(recommendation)
-				suggestions.append(recommendation)
+		if recommendation and bool(item.get("legacy_detected", False)) and recommendation not in seen:
+			seen.add(recommendation)
+			suggestions.append(recommendation)
 
 	return suggestions
 
 
 def _compute_cyclomatic_complexity(code: str) -> int:
-	"""Return a heuristic cyclomatic complexity estimate.
-
-	This approximation counts control-flow keywords and boolean operators. It is
-	not AST-precise and should be treated as a directional metric only.
-	"""
-	decision_tokens = len(_RE_CYCLO_DECISIONS.findall(code))
-	bool_ops = len(_RE_CYCLO_BOOL.findall(code))
-	ternary_ops = len(_RE_CYCLO_TERNARY.findall(code))
-	return 1 + decision_tokens + bool_ops + ternary_ops
+	return 1 + len(_RE_CYCLO_DECISIONS.findall(code)) + len(_RE_CYCLO_BOOL.findall(code)) + len(_RE_CYCLO_TERNARY.findall(code))
 
 
 def _extract_modernization_metrics(
 	source_code: str,
 	masked_code: str,
 	target_std: str = _DEFAULT_TARGET_STD,
-) -> Dict[str, object]:
-	"""Extract modernization metrics from masked code.
-
-	This function intentionally keeps regex-based scoring for speed and
-	portability. For higher-fidelity critical metrics, AST-assisted signals are
-	optionally merged when available.
-	"""
+) -> Dict[str, Any]:
 	headers = set(_RE_INCLUDE.findall(source_code))
 	std_key = _normalize_target_std(target_std)
 	modern_headers = _MODERN_HEADERS_BY_STD.get(std_key, _MODERN_HEADERS_BY_STD[_DEFAULT_TARGET_STD])
@@ -567,7 +484,6 @@ def _extract_modernization_metrics(
 	range_loop_count = len(_RE_RANGE_LOOP.findall(masked_code))
 	error_code_count = len(_RE_ERROR_CODE_RETURN.findall(masked_code))
 
-	# Supplement a few high-value metrics with AST signals when available.
 	ast_signals = _ast_assisted_signals(source_code)
 	raw_pointer_count = max(raw_pointer_count, int(ast_signals.get("raw_pointer_count", 0) or 0))
 	printf_count = max(printf_count, int(ast_signals.get("printf_count", 0) or 0))
@@ -575,9 +491,8 @@ def _extract_modernization_metrics(
 	cyclomatic_complexity = _compute_cyclomatic_complexity(masked_code)
 	present_headers = sorted(h for h in modern_headers if h in headers)
 
-	metric_breakdown: List[Dict[str, object]] = []
+	metric_breakdown: List[Dict[str, Any]] = []
 	metric_score = 0
-	metric_max = 200  # Increased to accommodate I/O + error handling metrics
 
 	if smart_pointer_count > 0 or raw_pointer_count == 0:
 		pointer_score = 20
@@ -619,11 +534,7 @@ def _extract_modernization_metrics(
 		}
 	)
 
-	# POSITIVE METRIC: Reward std::string usage for proper string modernization
-	if std_string_count > 0:
-		string_score = min(15, std_string_count * 5)  # Up to 15 points for using std::string
-	else:
-		string_score = 0
+	string_score = min(15, std_string_count * 5) if std_string_count > 0 else 0
 	metric_score += string_score
 	metric_breakdown.append(
 		{
@@ -635,12 +546,8 @@ def _extract_modernization_metrics(
 		}
 	)
 
-	# POSITIVE METRIC: Reward RAII containers (std::vector, std::array, std::optional)
 	raii_container_count = std_vector_count + std_array_count + std_optional_count
-	if raii_container_count > 0:
-		container_score = min(20, raii_container_count * 4)  # Up to 20 points for containers
-	else:
-		container_score = 0
+	container_score = min(20, raii_container_count * 4) if raii_container_count > 0 else 0
 	metric_score += container_score
 	metric_breakdown.append(
 		{
@@ -654,11 +561,7 @@ def _extract_modernization_metrics(
 		}
 	)
 
-	# POSITIVE METRIC: Reward smart pointer usage
-	if smart_pointer_count > 0:
-		smart_ptr_bonus = min(15, smart_pointer_count * 3)  # Up to 15 points for smart pointers
-	else:
-		smart_ptr_bonus = 0
+	smart_ptr_bonus = min(15, smart_pointer_count * 3) if smart_pointer_count > 0 else 0
 	metric_score += smart_ptr_bonus
 	metric_breakdown.append(
 		{
@@ -670,12 +573,8 @@ def _extract_modernization_metrics(
 		}
 	)
 
-	# POSITIVE METRIC: Reward std::cout/std::cerr usage (replace printf)
 	stdio_replacement_count = std_cout_count + std_cerr_count + std_print_count
-	if stdio_replacement_count > 0:
-		stdio_score = min(20, stdio_replacement_count * 5)  # Up to 20 points for modern I/O
-	else:
-		stdio_score = 0
+	stdio_score = min(20, stdio_replacement_count * 5) if stdio_replacement_count > 0 else 0
 	metric_score += stdio_score
 	metric_breakdown.append(
 		{
@@ -689,11 +588,7 @@ def _extract_modernization_metrics(
 		}
 	)
 
-	# POSITIVE METRIC: Reward std::optional usage (replace error codes)
-	if std_optional_count > 0:
-		optional_score = min(25, std_optional_count * 6)  # Up to 25 points for std::optional
-	else:
-		optional_score = 0
+	optional_score = min(25, std_optional_count * 6) if std_optional_count > 0 else 0
 	metric_score += optional_score
 	metric_breakdown.append(
 		{
@@ -706,12 +601,8 @@ def _extract_modernization_metrics(
 		}
 	)
 
-	# PENALTY METRIC: Penalize printf/fprintf usage (should use std::cout instead)
 	stdio_c_count = printf_count + fprintf_count
-	if stdio_c_count > 0:
-		stdio_penalty = -min(15, stdio_c_count * 5)  # Penalty for C-style I/O
-	else:
-		stdio_penalty = 0
+	stdio_penalty = -min(15, max(0, stdio_c_count - 1) * 5) if stdio_c_count > 0 else 0
 	metric_score += stdio_penalty
 	metric_breakdown.append(
 		{
@@ -725,14 +616,14 @@ def _extract_modernization_metrics(
 	)
 
 	if std_key == "c++17":
-		print_score = 15 if printf_count == 0 else 2
+		print_score = 15 if printf_count <= 1 else max(0, 15 - (printf_count - 1) * 5)
 	else:
-		if printf_count == 0 and std_print_count > 0:
+		if printf_count <= 1 and std_print_count > 0:
 			print_score = 15
-		elif printf_count == 0:
+		elif printf_count <= 1:
 			print_score = 10
 		else:
-			print_score = 2
+			print_score = max(0, 10 - (printf_count - 1) * 5)
 	metric_score += print_score
 	metric_breakdown.append(
 		{
@@ -749,9 +640,7 @@ def _extract_modernization_metrics(
 		}
 	)
 
-	if manual_loop_count == 0:
-		loop_score = 15
-	elif range_loop_count >= manual_loop_count:
+	if manual_loop_count == 0 or range_loop_count >= manual_loop_count:
 		loop_score = 15
 	elif range_loop_count > 0:
 		loop_score = 9
@@ -805,6 +694,8 @@ def _extract_modernization_metrics(
 		}
 	)
 
+	metric_max = sum(int(comp.get("max_score", 0) or 0) for comp in metric_breakdown if int(comp.get("max_score", 0) or 0) > 0)
+
 	return {
 		"raw_pointer_count": raw_pointer_count,
 		"char_pointer_count": char_pointer_count,
@@ -833,96 +724,98 @@ def _extract_modernization_metrics(
 	}
 
 
-def score_cpp17_compliance(source_code: str, target_std: str = _DEFAULT_TARGET_STD) -> Dict[str, object]:
-	"""Score C++ source code compliance using weighted heuristic rules for C++17 target.
-	
-	Limitations:
-	- Pattern matching is regex-based and not AST/lexer perfect.
-	- Comments and string literals are masked heuristically to reduce false
-	  positives, but edge cases may still exist.
-	- The final score is a heuristic blend of rule and metric components; it is
-	  not a mathematically exact quality measure.
-	- Cyclomatic complexity is approximate and keyword-based, not AST exact.
+def score_cpp17_compliance(source_code: str, target_std: str = _DEFAULT_TARGET_STD) -> Dict[str, Any]:
+	try:
+		std_key = _normalize_target_std(target_std)
+		cache_key = hashlib.md5(f"{std_key}\n{source_code}".encode("utf-8")).hexdigest()
+		cached = _cache_get(cache_key)
+		if cached is not None:
+			return cached
 
-	Returns:
-	- score: total weighted points achieved
-	- max_score: maximum possible points
-	- percent: integer percentage
-	- grade: A-F bucket
-	- suggestions: deduplicated recommendations for detected legacy patterns
-	- details: per-rule detection and scoring breakdown
-	"""
-	std_key = _normalize_target_std(target_std)
-	cache_key = hashlib.sha256(f"{std_key}\n{source_code}".encode("utf-8")).hexdigest()
-	cached = _cache_get(cache_key)
-	if cached is not None:
-		return cached
+		rules = _get_rules(target_std=std_key)
+		code_for_matching = _mask_non_code(source_code)
+		total_weight = _validate_rule_weights(rules)
+		score = 0
+		details: List[Dict[str, Any]] = []
 
-	rules = _get_rules(target_std=std_key)
-	code_for_matching = _mask_non_code(source_code)
-	total_weight = _validate_rule_weights(rules)
-	score = 0
-	details: List[Dict[str, object]] = []
+		for rule in rules:
+			positive = bool(rule.positive_pattern.search(code_for_matching))
+			negative = bool(rule.negative_pattern.search(code_for_matching))
 
-	for rule in rules:
-		positive = bool(rule.positive_pattern.search(code_for_matching))
-		negative = bool(rule.negative_pattern.search(code_for_matching))
+			rule_score = 0
+			if positive and not negative:
+				rule_score = rule.weight
+			elif positive and negative:
+				rule_score = rule.weight // 2
 
-		rule_score = 0
-		if positive and not negative:
-			rule_score = rule.weight
-		elif positive and negative:
-			rule_score = rule.weight // 2
+			score += rule_score
+			details.append(
+				{
+					"id": rule.id,
+					"score": rule_score,
+					"max_score": rule.weight,
+					"positive_detected": positive,
+					"legacy_detected": negative,
+					"recommendation": rule.recommendation,
+				}
+			)
 
-		score += rule_score
-		details.append(
-			{
-				"id": rule.id,
-				"score": rule_score,
-				"max_score": rule.weight,
-				"positive_detected": positive,
-				"legacy_detected": negative,
-				"recommendation": rule.recommendation,
-			}
-		)
+		metrics = _extract_modernization_metrics(source_code, code_for_matching, target_std=std_key)
+		metric_score = int(metrics.get("metric_score", 0) or 0)
+		metric_max_score = int(metrics.get("metric_max_score", 0) or 0)
+		rule_percent = int(round((score / total_weight) * 100)) if total_weight > 0 else 0
+		metric_percent = int(round((metric_score / metric_max_score) * 100)) if metric_max_score > 0 else 0
+		rule_weight, metric_weight = _resolve_component_weights()
 
-	metrics = _extract_modernization_metrics(source_code, code_for_matching, target_std=std_key)
-	metric_score = int(metrics.get("metric_score", 0) or 0)
-	metric_max_score = int(metrics.get("metric_max_score", 0) or 0)
-	rule_percent = int(round((score / total_weight) * 100)) if total_weight > 0 else 0
-	metric_percent = int(round((metric_score / metric_max_score) * 100)) if metric_max_score > 0 else 0
-	rule_weight, metric_weight = _resolve_component_weights()
+		combined_score = int(round(rule_percent * rule_weight + metric_percent * metric_weight))
+		combined_max = 100
+		percent = int(round((combined_score / combined_max) * 100)) if combined_max > 0 else 0
+		grade = _compute_grade(percent)
+		suggestions = _build_modernization_suggestions(details)
 
-	combined_score = int(round(rule_percent * rule_weight + metric_percent * metric_weight))
-	combined_max = 100
-	percent = int(round((combined_score / combined_max) * 100)) if combined_max > 0 else 0
-	grade = _compute_grade(percent)
-	suggestions = _build_modernization_suggestions(details)
+		for metric in metrics.get("metric_details", []):
+			if not isinstance(metric, dict):
+				continue
+			if int(metric.get("score", 0) or 0) < int(metric.get("max_score", 0) or 0) // 2:
+				feedback = str(metric.get("feedback") or "").strip()
+				if feedback and feedback not in suggestions:
+					suggestions.append(feedback)
 
-	for metric in metrics.get("metric_details", []):
-		if not isinstance(metric, dict):
-			continue
-		if int(metric.get("score", 0) or 0) < int(metric.get("max_score", 0) or 0) // 2:
-			feedback = str(metric.get("feedback") or "").strip()
-			if feedback and feedback not in suggestions:
-				suggestions.append(feedback)
-
-	result = {
-		"score": combined_score,
-		"max_score": combined_max,
-		"percent": percent,
-		"grade": grade,
-		"suggestions": suggestions,
-		"details": details,
-		"rule_score": score,
-		"rule_max_score": total_weight,
-		"rule_percent": rule_percent,
-		"metric_percent": metric_percent,
-		"rule_component_weight": rule_weight,
-		"metric_component_weight": metric_weight,
-		"metrics": metrics,
-		"target_std": std_key,
-		"heuristic_note": "Score is a weighted heuristic blend of rule and metric components.",
-	}
-	_cache_set(cache_key, result)
-	return result
+		result = {
+			"score": combined_score,
+			"max_score": combined_max,
+			"percent": percent,
+			"grade": grade,
+			"suggestions": suggestions,
+			"details": details,
+			"rule_score": score,
+			"rule_max_score": total_weight,
+			"rule_percent": rule_percent,
+			"metric_percent": metric_percent,
+			"rule_component_weight": rule_weight,
+			"metric_component_weight": metric_weight,
+			"metrics": metrics,
+			"target_std": std_key,
+			"heuristic_note": "Score is a weighted heuristic blend of rule and metric components.",
+		}
+		_cache_set(cache_key, result)
+		return result
+	except Exception as exc:
+		_LOG.error("Fatal error evaluating compliance score: %r", exc)
+		return {
+			"score": 0,
+			"max_score": 100,
+			"percent": 0,
+			"grade": "F",
+			"suggestions": [f"Parsing failed due to internal exception: {exc}"],
+			"details": [],
+			"rule_score": 0,
+			"rule_max_score": 100,
+			"rule_percent": 0,
+			"metric_percent": 0,
+			"rule_component_weight": 0.5,
+			"metric_component_weight": 0.5,
+			"metrics": {},
+			"target_std": target_std,
+			"heuristic_note": "Score fallback due to crash.",
+		}

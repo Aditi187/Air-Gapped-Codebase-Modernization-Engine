@@ -1,46 +1,51 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+#include <iostream>
+#include <string>
+#include <vector>
+#include <memory>
 
-// Global pointer - a nightmare for thread safety and modernization
-char* GLOBAL_LOG_BUFFER = NULL;
+class Shape {
+public:
+    std::string color;
+    Shape(const char* c) : color(c ? c : "") {}
+    virtual ~Shape() = default;
+    virtual void draw() = 0;
+};
 
-typedef struct {
-    int id;
-    char* raw_data;
-    size_t len;
-} LegacyRecord;
-
-// Hard to modernize: returns raw pointer, uses malloc, and return codes for errors
-int load_record(LegacyRecord** out_rec, int id) {
-    if (id <= 0) return -1; // Error code
-
-    *out_rec = (LegacyRecord*)malloc(sizeof(LegacyRecord));
-    (*out_rec)->id = id;
-    
-    const char* dummy = "DEVICE_DATA_STREAM_0xCF";
-    (*out_rec)->len = strlen(dummy);
-    (*out_rec)->raw_data = (char*)malloc((*out_rec)->len + 1);
-    strcpy((*out_rec)->raw_data, dummy);
-    
-    return 0; // Success code
-}
-
-void process_data() {
-    LegacyRecord* rec = NULL;
-    // Pointer to pointer logic is a great test for std::expected and smart pointers
-    if (load_record(&rec, 42) == 0) {
-        printf("Processing Record %d: %s\n", rec->id, rec->raw_data);
-        
-        // Manual cleanup often forgotten by lazy AI
-        free(rec->raw_data);
-        free(rec);
-    } else {
-        printf("Failed to load record.\n");
+class Circle : public Shape {
+public:
+    Circle(const char* c) : Shape(c) {}
+    void draw() override {
+        std::cout << "Drawing Circle (" << color << ")" << std::endl;
     }
-}
+};
+
+class Rectangle : public Shape {
+public:
+    Rectangle(const char* c) : Shape(c) {}
+    void draw() override {
+        std::cout << "Drawing Rectangle (" << color << ")" << std::endl;
+    }
+};
+
+class ShapeList {
+public:
+    std::vector<std::unique_ptr<Shape>> shapes;
+    ShapeList() = default;
+    ~ShapeList() = default;
+    void add(Shape* s) {
+        shapes.push_back(std::unique_ptr<Shape>(s));
+    }
+    void drawAll() {
+        for (const auto& s : shapes) {
+            s->draw();
+        }
+    }
+};
 
 int main() {
-    process_data();
+    ShapeList list;
+    list.add(std::make_unique<Circle>("Red").release());
+    list.add(std::make_unique<Rectangle>("Blue").release());
+    list.drawAll();
     return 0;
 }

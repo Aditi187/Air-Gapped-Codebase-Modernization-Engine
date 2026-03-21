@@ -35,38 +35,29 @@ def _read_env(*names: str, default: str = "") -> str:
 
 def parse_int_env(*names: str, default: int, minimum: int | None = None) -> int:
     raw = _read_env(*names, default="")
-    if not raw:
+    try:
+        value = int(raw) if raw else default
+    except ValueError:
+        _LOG.warning("Invalid integer for %s=%r. Using default=%d", "/".join(names), raw, default)
         value = default
-    else:
-        try:
-            value = int(raw)
-        except ValueError:
-            _LOG.warning("Invalid integer for %s=%r. Using default=%d", "/".join(names), raw, default)
-            value = default
-    if minimum is not None:
-        return max(minimum, value)
-    return value
+    return max(minimum, value) if minimum is not None else value
 
 
 def parse_float_env(*names: str, default: float, minimum: float | None = None) -> float:
     raw = _read_env(*names, default="")
-    if not raw:
+    try:
+        value = float(raw) if raw else default
+    except ValueError:
+        _LOG.warning("Invalid float for %s=%r. Using default=%s", "/".join(names), raw, default)
         value = default
-    else:
-        try:
-            value = float(raw)
-        except ValueError:
-            _LOG.warning("Invalid float for %s=%r. Using default=%s", "/".join(names), raw, default)
-            value = default
-    if minimum is not None:
-        return max(minimum, value)
-    return value
+    return max(minimum, value) if minimum is not None else value
 
 
 def parse_retry_delays_from_env(*names: str, default: tuple[int, ...]) -> tuple[float, ...]:
     raw = _read_env(*names, default="")
+    default_delays = tuple(float(item) for item in default)
     if not raw:
-        return tuple(float(item) for item in default)
+        return default_delays
 
     parsed: list[float] = []
     for token in raw.split(","):
@@ -81,70 +72,43 @@ def parse_retry_delays_from_env(*names: str, default: tuple[int, ...]) -> tuple[
         if value > 0:
             parsed.append(value)
 
-    if not parsed:
-        return tuple(float(item) for item in default)
-    return tuple(parsed)
+    return tuple(parsed) if parsed else default_delays
 
 
 def _dedupe_urls(urls: list[str]) -> list[str]:
-    ordered: list[str] = []
-    seen: set[str] = set()
-    for item in urls:
-        normalized = item.strip()
-        if not normalized or normalized in seen:
-            continue
-        seen.add(normalized)
-        ordered.append(normalized)
-    return ordered
+    return list(dict.fromkeys(url for item in urls if (url := item.strip())))
 
 
 class InvalidAPIKeyError(RuntimeError):
-    """Raised when API key is missing or unauthorized (401)."""
+    pass
 
 
 class LLMRequestError(RuntimeError):
-    """Base class for HTTP request failures."""
+    pass
 
 
 class ProviderQuotaExhaustedError(RuntimeError):
-    """Raised when provider returns repeated 429 errors."""
+    pass
 
 
 class LLMNetworkError(LLMRequestError):
-    """Raised on network failures after retries."""
+    pass
 
 
 class LLMTimeoutError(LLMNetworkError):
-    """Raised on network timeout failures after retries."""
+    pass
 
 
 class LLMConnectionError(LLMNetworkError):
-    """Raised on network connection failures after retries."""
+    pass
 
 
 class LLMHTTPError(LLMRequestError):
-    """Raised when remote endpoint returns an HTTP error status."""
+    pass
 
 
 @dataclass(frozen=True)
 class AgentRouterConfig:
-    """Validated runtime configuration for AgentRouterClient.
-
-    Environment variables (preferred first):
-    - API key: API_KEY
-    - Endpoint: LLM_ENDPOINT_BASE, OPENAI_ENDPOINT_BASE
-    - Model: LLM_MODEL, OPENAI_MODEL, OPENAI_MODELS (first entry)
-    - Prompt limit chars: LLM_MAX_PROMPT_CHARS, OPENAI_MAX_PROMPT_CHARS
-      - Use 0 to disable prompt truncation.
-    - Prompt truncation side: LLM_PROMPT_TRUNCATE_SIDE (tail|head)
-    - Cache size: LLM_CACHE_MAX_SIZE, OPENAI_CACHE_MAX_SIZE
-    - Timeouts/tokens/retries:
-      - LLM_MAX_OUTPUT_TOKENS, OPENAI_MAX_TOKENS
-      - LLM_REQUEST_TIMEOUT_SECONDS, OPENAI_REQUEST_TIMEOUT_SECONDS
-      - LLM_RETRY_DELAYS
-      - LLM_INTER_REQUEST_DELAY_SECONDS, OPENAI_INTER_REQUEST_DELAY_SECONDS
-    """
-
     api_key: str
     endpoint_base: str
     model: str
@@ -218,8 +182,6 @@ class AgentRouterConfig:
 
 
 class AgentRouterClient:
-    """Reusable OpenAI-compatible client for Agent Router style endpoints."""
-
     def __init__(self, config: AgentRouterConfig) -> None:
         self.config = config
         self._lock = threading.Lock()
@@ -247,38 +209,17 @@ class AgentRouterClient:
         return self.config.model
 
     def _build_chat_completion_urls(self) -> list[str]:
-        base = self.config.endpoint_base.rstrip("/")
-        if base.endswith("/v1"):
-            root = base[: -len("/v1")]
-            return _dedupe_urls(
-                [
-                    f"{base}/chat/completions",
-                    f"{root}/chat/completions",
-                ]
-            )
-        return _dedupe_urls(
-            [
-                f"{base}/v1/chat/completions",
-                f"{base}/chat/completions",
-            ]
-        )
+        return self._build_candidate_urls("chat/completions")
 
     def _build_model_list_urls(self) -> list[str]:
+        return self._build_candidate_urls("models")
+
+    def _build_candidate_urls(self, suffix: str) -> list[str]:
         base = self.config.endpoint_base.rstrip("/")
         if base.endswith("/v1"):
             root = base[: -len("/v1")]
-            return _dedupe_urls(
-                [
-                    f"{base}/models",
-                    f"{root}/models",
-                ]
-            )
-        return _dedupe_urls(
-            [
-                f"{base}/v1/models",
-                f"{base}/models",
-            ]
-        )
+            return _dedupe_urls([f"{base}/{suffix}", f"{root}/{suffix}"])
+        return _dedupe_urls([f"{base}/v1/{suffix}", f"{base}/{suffix}"])
 
     def chat_completion_urls(self) -> list[str]:
         return list(self._chat_endpoints)
@@ -351,13 +292,7 @@ class AgentRouterClient:
             event.set()
 
     def _ordered_endpoints(self, preferred: str | None, candidates: list[str]) -> list[str]:
-        ordered: list[str] = []
-        if preferred and preferred in candidates:
-            ordered.append(preferred)
-        for endpoint in candidates:
-            if endpoint not in ordered:
-                ordered.append(endpoint)
-        return ordered
+        return ([preferred] if preferred and preferred in candidates else []) + [endpoint for endpoint in candidates if endpoint != preferred]
 
     def _request_json(
         self,
@@ -368,8 +303,7 @@ class AgentRouterClient:
         json_payload: dict[str, Any] | None = None,
     ) -> requests.Response:
         try:
-            response = self._session.request(method=method, url=endpoint_url, json=json_payload, timeout=timeout)
-            return response
+            return self._session.request(method=method, url=endpoint_url, json=json_payload, timeout=timeout)
         except requests.Timeout as exc:
             raise LLMTimeoutError(f"Request timed out for endpoint={endpoint_url}") from exc
         except requests.ConnectionError as exc:
@@ -391,9 +325,7 @@ class AgentRouterClient:
             limit,
             self.config.prompt_truncate_side,
         )
-        if self.config.prompt_truncate_side == "head":
-            return clean_text[:limit]
-        return clean_text[-limit:]
+        return clean_text[:limit] if self.config.prompt_truncate_side == "head" else clean_text[-limit:]
 
     def _build_payload(
         self,
@@ -505,8 +437,7 @@ class AgentRouterClient:
             max_tokens=effective_max_tokens,
         )
 
-        merged_extra_params = dict(extra_params or {})
-        merged_extra_params.update(model_params)
+        merged_extra_params = {**(extra_params or {}), **model_params}
 
         if use_cache:
             cached = self._cache_get(key)
@@ -514,7 +445,6 @@ class AgentRouterClient:
                 _LOG.debug("Cache hit for model=%s", model_name)
                 return cached
             if self._wait_for_inflight(key):
-                # Another thread completed the same key; return cached if present.
                 cached = self._cache_get(key)
                 if isinstance(cached, dict):
                     return cached
@@ -595,9 +525,7 @@ class AgentRouterClient:
 
         try:
             _endpoint, response = self._resolve_model_endpoint(timeout=10)
-        except LLMNetworkError as exc:
-            return False, str(exc)
-        except RuntimeError as exc:
+        except (LLMNetworkError, RuntimeError) as exc:
             return False, str(exc)
 
         if response.status_code == 401:
@@ -616,9 +544,7 @@ class AgentRouterClient:
         }
         try:
             endpoint_url, probe = self._resolve_chat_endpoint(payload=probe_payload, timeout=(10, 10))
-        except LLMNetworkError as exc:
-            return False, "Health probe failed: " + str(exc)
-        except RuntimeError as exc:
+        except (LLMNetworkError, RuntimeError) as exc:
             return False, "Health probe failed: " + str(exc)
 
         _LOG.info("Health probe used endpoint=%s model=%s", endpoint_url, self.config.model)

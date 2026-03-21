@@ -5,73 +5,81 @@ import importlib
 import os
 import threading
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Dict, List, Optional, Tuple
 
 
-@dataclass
+@dataclass(slots=True)
 class _StoredDoc:
     doc_id: str
     code: str
-    metadata: dict[str, Any]
+    metadata: Dict[str, Any]
 
 
 class CodeRAG:
-    """Optional retrieval layer for code snippets.
-
-    Backend priority:
-    1) ChromaDB + sentence-transformers embeddings
-    2) Lightweight lexical fallback in memory
-    """
-
     def __init__(self, enabled: bool = False) -> None:
         self.enabled = bool(enabled)
         self._lock = threading.Lock()
-        self._documents: dict[str, _StoredDoc] = {}
+        self._documents: Dict[str, _StoredDoc] = {}
 
         self._chroma_collection = None
         self._embedder = None
+
         if not self.enabled:
             return
 
         model_name = os.environ.get("RAG_EMBED_MODEL", "all-MiniLM-L6-v2").strip() or "all-MiniLM-L6-v2"
-        persist_dir = os.environ.get("RAG_PERSIST_DIR", os.path.join(os.getcwd(), "cache", "rag_chroma")).strip()
+        persist_dir = os.environ.get(
+            "RAG_PERSIST_DIR",
+            os.path.join(os.getcwd(), "cache", "rag_chroma"),
+        ).strip()
 
         try:
             chromadb = importlib.import_module("chromadb")
             sentence_transformers = importlib.import_module("sentence_transformers")
-            sentence_transformer_cls = getattr(sentence_transformers, "SentenceTransformer", None)
-            if sentence_transformer_cls is None:
-                raise RuntimeError("SentenceTransformer class not available")
 
-            self._embedder = sentence_transformer_cls(model_name)
+            SentenceTransformer = getattr(sentence_transformers, "SentenceTransformer", None)
+            if SentenceTransformer is None:
+                raise RuntimeError("SentenceTransformer not available")
+
+            self._embedder = SentenceTransformer(model_name)
+
             client = chromadb.PersistentClient(path=persist_dir)
             self._chroma_collection = client.get_or_create_collection("code_chunks")
+
         except Exception:
+            # graceful fallback
             self._embedder = None
             self._chroma_collection = None
 
-    @staticmethod
-    def _stable_id(code: str, metadata: dict[str, Any]) -> str:
-        payload = f"{code}|{sorted((metadata or {}).items())}"
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
-    def add_document(self, code: str, metadata: dict[str, Any] | None = None) -> None:
+    @staticmethod
+    def _stable_id(code: str, metadata: Dict[str, Any]) -> str:
+        meta_str = "|".join(f"{k}:{v}" for k, v in sorted((metadata or {}).items()))
+        return hashlib.sha256(f"{code}|{meta_str}".encode("utf-8")).hexdigest()
+
+
+    def add_document(self, code: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         if not self.enabled:
             return
+
         text = str(code or "").strip()
         if not text:
             return
 
         meta = dict(metadata or {})
         doc_id = self._stable_id(text, meta)
+
         with self._lock:
+            if doc_id in self._documents:
+                return  # prevent duplicates
             self._documents[doc_id] = _StoredDoc(doc_id=doc_id, code=text, metadata=meta)
 
-        if self._chroma_collection is None or self._embedder is None:
+        if not (self._chroma_collection and self._embedder):
             return
 
         try:
-            embedding = self._embedder.encode([text])[0].tolist()
+            embedding = self._embedder.encode(text).tolist()
+
             self._chroma_collection.upsert(
                 ids=[doc_id],
                 documents=[text],
@@ -79,66 +87,90 @@ class CodeRAG:
                 embeddings=[embedding],
             )
         except Exception:
-            return
+            # fail silently → fallback still works
+            pass
 
-    def search(self, query: str, k: int = 5) -> list[dict[str, Any]]:
+
+    def search(self, query: str, k: int = 5) -> List[Dict[str, Any]]:
         if not self.enabled:
             return []
 
-        top_k = max(1, int(k))
         query_text = str(query or "").strip()
         if not query_text:
             return []
 
+        top_k = max(1, int(k))
+
+        # ---------------- VECTOR SEARCH ----------------
         if self._chroma_collection is not None and self._embedder is not None:
             try:
-                query_embedding = self._embedder.encode([query_text])[0].tolist()
-                result = self._chroma_collection.query(query_embeddings=[query_embedding], n_results=top_k)
+                query_embedding = self._embedder.encode(query_text).tolist()
+
+                result = self._chroma_collection.query(
+                    query_embeddings=[query_embedding],
+                    n_results=top_k,
+                )
+
                 docs = (result.get("documents") or [[]])[0]
                 metas = (result.get("metadatas") or [[]])[0]
-                out: list[dict[str, Any]] = []
-                for idx, doc in enumerate(docs):
-                    out.append(
-                        {
-                            "code": str(doc or ""),
-                            "metadata": metas[idx] if idx < len(metas) and isinstance(metas[idx], dict) else {},
-                        }
-                    )
-                return out
-            except Exception:
-                pass
 
-        # Lexical fallback when embedding backend is unavailable.
+                return [
+                    {
+                        "code": str(doc or ""),
+                        "metadata": metas[i] if i < len(metas) and isinstance(metas[i], dict) else {},
+                    }
+                    for i, doc in enumerate(docs)
+                ]
+
+            except Exception:
+                pass  # fallback to local search
+
+        # ---------------- FALLBACK SEARCH ----------------
         query_tokens = set(query_text.lower().split())
-        scored: list[tuple[float, _StoredDoc]] = []
+        scored: List[Tuple[float, _StoredDoc]] = []
+
         with self._lock:
             docs = list(self._documents.values())
+
         for item in docs:
             code_tokens = set(item.code.lower().split())
             if not code_tokens:
                 continue
-            overlap = len(query_tokens & code_tokens)
-            denom = max(1, len(query_tokens | code_tokens))
-            score = overlap / denom
+
+            # Jaccard similarity
+            intersection = len(query_tokens & code_tokens)
+            union = len(query_tokens | code_tokens)
+
+            if union == 0:
+                continue
+
+            score = intersection / union
+
+            # boost if substring match (important improvement)
+            if query_text.lower() in item.code.lower():
+                score += 0.2
+
             if score > 0:
                 scored.append((score, item))
-        scored.sort(key=lambda pair: pair[0], reverse=True)
+
+        scored.sort(key=lambda x: x[0], reverse=True)
 
         return [
             {"code": item.code, "metadata": item.metadata}
-            for _score, item in scored[:top_k]
+            for _, item in scored[:top_k]
         ]
 
 
-_GLOBAL_RAG: CodeRAG | None = None
+_GLOBAL_RAG: Optional[CodeRAG] = None
 _GLOBAL_RAG_LOCK = threading.Lock()
 
 
-def get_global_rag(enabled: bool = False) -> CodeRAG | None:
-    """Return a process-wide RAG instance when enabled, otherwise None."""
+def get_global_rag(enabled: bool = False) -> Optional[CodeRAG]:
     if not enabled:
         return None
+
     global _GLOBAL_RAG
+
     with _GLOBAL_RAG_LOCK:
         if _GLOBAL_RAG is None:
             _GLOBAL_RAG = CodeRAG(enabled=True)
