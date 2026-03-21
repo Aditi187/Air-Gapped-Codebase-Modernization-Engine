@@ -1,51 +1,70 @@
 #include <iostream>
-#include <string>
-#include <vector>
-#include <memory>
+#include <cstring>
+#include <cstdlib>
 
-class Shape {
+class Student {
 public:
-    std::string color;
-    Shape(const char* c) : color(c ? c : "") {}
-    virtual ~Shape() = default;
-    virtual void draw() = 0;
-};
+    char* name;
+    int age;
 
-class Circle : public Shape {
-public:
-    Circle(const char* c) : Shape(c) {}
-    void draw() override {
-        std::cout << "Drawing Circle (" << color << ")" << std::endl;
+    Student(const char* n, int a) {
+        name = (char*)malloc(strlen(n) + 1);
+        strcpy(name, n);
+        age = a;
+    }
+
+    ~Student() {
+        free(name);
+    }
+
+    void print() {
+        std::cout << "Name: " << name << ", Age: " << age << std::endl;
     }
 };
 
-class Rectangle : public Shape {
-public:
-    Rectangle(const char* c) : Shape(c) {}
-    void draw() override {
-        std::cout << "Drawing Rectangle (" << color << ")" << std::endl;
-    }
-};
+class StudentManager {
+private:
+    Student** students;
+    int size;
+    int capacity;
 
-class ShapeList {
 public:
-    std::vector<std::unique_ptr<Shape>> shapes;
-    ShapeList() = default;
-    ~ShapeList() = default;
-    void add(Shape* s) {
-        shapes.push_back(std::unique_ptr<Shape>(s));
+    StudentManager() {
+        size = 0;
+        capacity = 2;
+        students = (Student**)malloc(sizeof(Student*) * capacity);
     }
-    void drawAll() {
-        for (const auto& s : shapes) {
-            s->draw();
+
+    ~StudentManager() {
+        for (int i = 0; i < size; i++) {
+            delete students[i];
+        }
+        free(students);
+    }
+
+    void addStudent(const char* name, int age) {
+        if (size == capacity) {
+            capacity *= 2;
+            students = (Student**)realloc(students, sizeof(Student*) * capacity);
+        }
+        students[size++] = new Student(name, age);
+    }
+
+    void printAll() {
+        for (int i = 0; i < size; i++) {
+            students[i]->print();
         }
     }
 };
 
 int main() {
-    ShapeList list;
-    list.add(std::make_unique<Circle>("Red").release());
-    list.add(std::make_unique<Rectangle>("Blue").release());
-    list.drawAll();
+    StudentManager manager;
+
+    manager.addStudent("Alice", 20);
+    manager.addStudent("Bob", 22);
+    manager.addStudent("Charlie", 21);
+
+    manager.printAll();
+
     return 0;
 }

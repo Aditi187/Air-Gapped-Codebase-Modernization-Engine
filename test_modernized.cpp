@@ -3,49 +3,35 @@
 #include <vector>
 #include <memory>
 
-class Shape {
+class Student {
 public:
-    std::string color;
-    Shape(const std::string& c) : color(c) {}
-    virtual ~Shape() = default;
-    virtual void draw() = 0;
-};
-
-class Circle : public Shape {
-public:
-    Circle(const std::string& c) : Shape(c) {}
-    void draw() override {
-        std::cout << "Drawing Circle (" << color << ")" << std::endl;
+    std::string name;
+    int age;
+    Student(const std::string& n, int a) : name(n), age(a) {}
+    void print() const {
+        std::cout << "Name: " << name << ", Age: " << age << std::endl;
     }
 };
 
-class Rectangle : public Shape {
+class StudentManager {
+private:
+    std::vector<std::unique_ptr<Student>> students_;
 public:
-    Rectangle(const std::string& c) : Shape(c) {}
-    void draw() override {
-        std::cout << "Drawing Rectangle (" << color << ")" << std::endl;
+    void addStudent(std::string name, int age) {
+        students_.emplace_back(std::make_unique<Student>(std::move(name), age));
     }
-};
-
-class ShapeList {
-public:
-    std::vector<std::unique_ptr<Shape>> shapes;
-    ShapeList() = default;
-    ~ShapeList() = default;
-    void add(std::unique_ptr<Shape> s) {
-        shapes.push_back(std::move(s));
-    }
-    void drawAll() const {
-        for (const auto& shape : shapes) {
-            shape->draw();
+    void printAll() const {
+        for (const auto& student : students_) {
+            student->print();
         }
     }
 };
 
 int main() {
-    ShapeList list;
-    list.add(std::make_unique<Circle>("Red"));
-    list.add(std::make_unique<Rectangle>("Blue"));
-    list.drawAll();
+    StudentManager manager;
+    manager.addStudent("Alice", 20);
+    manager.addStudent("Bob", 22);
+    manager.addStudent("Charlie", 21);
+    manager.printAll();
     return 0;
 }
