@@ -1,101 +1,84 @@
 # Air-Gapped Codebase Modernization Engine
 
-Modernizes legacy C++ code using a LangGraph workflow with an OpenAI-backed LLM and deterministic fallback.
+Modernizes legacy C++ code using a modular, node-based LangGraph workflow with LLM-backed intelligence and robust rule-based fallbacks.
 
 ## Project Structure
 
 ```text
-agents/   # Workflow orchestration and modernization agents
-core/     # Parser, graph, LLM bridge, tester, and modernization engines
-tools/    # MCP server and integration tools
-tests/    # Unit and integration tests
-docs/     # Refactoring and technical documentation
-cache/    # Runtime cache data (not required for source control)
+agents/
+  workflow/         # New Modular Workflow System
+    nodes/          # Workflow steps (Analyzer, Modernizer, Verifier, Fixer, etc.)
+    infra/          # Infrastructure (Tracing, Model Provider, Exceptions)
+    validation/     # AST and Structural validation logic
+    orchestrator.py # State Graph Orchestration
+    cli.py          # Command Line Interface
+core/               # Core engines (Parser, RuleModernizer, Similarity, RAG)
+tools/              # Integration tools and MCP server
+tests/              # Test suites
+cache/              # Runtime cache (Tokens, OpenAI, RAG)
 ```
 
 ## Overview
 
-The engine parses C++ source, builds dependency order, modernizes function-by-function, compiles, and verifies behavior. The workflow path is Analyzer -> Modernizer -> Verifier (and tester routing), with automatic no-LLM fallback when provider health or quota is unavailable.
+The engine utilizes a state-graph architecture to transform legacy C++ into modern C++17. The pipeline follows a structured flow: **Analyze → Plan → Modernize (Parallel) → Verify → Fix (Surgical) → Test**.
 
 ## Features
 
-- C++ parsing with tree-sitter.
-- Dependency-aware modernization ordering.
-- OpenAI provider bridge for model calls.
-- Deterministic rule-based fallback when LLM is unavailable.
-- Differential compile/run parity checks.
-- LangFuse trace and generation observability.
-- MCP server for tool-based integration.
-
-## Requirements
-
-- Python 3.12 or 3.13.
-- C++ compiler on PATH (g++ or clang++).
-- OpenAI API key.
+- **Modular Node Architecture**: Scalable, maintainable workflow powered by LangGraph.
+- **Parallel Function Modernization**: Uses `ThreadPoolExecutor` for high-throughput batch processing.
+- **Hybrid Modernization**: Combines LLM intelligence with deterministic `RuleModernizer` fallbacks.
+- **Hierarchical Tracing**: Full project lifecycle observability via Langfuse (spans, events, and cost tracking).
+- **Advanced Validation**: AST-based structural checks and differential parity testing.
+- **RAII Enforcement**: Strict prompts ensuring modern memory management (`std::unique_ptr`, `std::vector`, `std::string`).
 
 ## Installation
 
-```bash
-py -3.12 -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
-```
+1. Create a virtual environment:
+   ```bash
+   python -m venv .venv
+   .venv\Scripts\activate
+   ```
+2. Install dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-## Environment
+## Configuration
 
-Configure [.env](.env) with OpenAI settings.
-
-```bash
-WORKFLOW_MODEL_PROVIDER=openai
-API_KEY=...
-OPENAI_MODELS=gpt-5.3-codex-xhigh
-OPENAI_ENABLE_CACHE=1
-OPENAI_MAX_CALLS_PER_MINUTE=35
-OPENAI_INTER_REQUEST_DELAY_SECONDS=1.5
-OPENAI_429_BASE_DELAY_SECONDS=60
-OPENAI_429_MAX_DELAY_SECONDS=900
-WORKFLOW_BATCH_SIZE=3
-WORKFLOW_MIN_FINAL_SCORE=55
-WORKFLOW_MIN_SCORE_DELTA=8
-WORKFLOW_STRICT_CPP17_MODE=1
-CPP17_STRICT_TARGET_PERCENT=70
-
-# Langfuse (optional but recommended)
-LANGFUSE_PUBLIC_KEY=...
-LANGFUSE_SECRET_KEY=...
-LANGFUSE_HOST=https://cloud.langfuse.com
-LANGFUSE_AUTO_FLUSH=1
-```
-
-## Run Workflow
+Copy [.env.example](.env.example) to `.env` and configure your API keys and model settings.
 
 ```bash
-python agents/workflow.py
+cp .env.example .env
 ```
 
-Default sample input is [test.cpp](test.cpp), and output is written to [test_modernized.cpp](test_modernized.cpp).
+Key Variables:
+- `API_KEY`: Modernization LLM provider key (e.g., NVIDIA, OpenAI).
+- `LANGFUSE_SECRET_KEY`: Tracing dashboard key.
+- `WORKFLOW_BATCH_SIZE`: Number of functions to process in parallel.
 
-## Run MCP Server
+## Usage
+
+### Run Modernization CLI
+
+```bash
+python -m agents.workflow.cli <path_to_file.cpp> --mode aggressive
+```
+
+- `--mode safe`: (Default) No signature changes.
+- `--mode aggressive`: Allows RAII-driven signature refactoring.
+- `--output`: Specify custom output path.
+
+### Run MCP Server (Integration)
 
 ```bash
 python tools/mcp_server.py
 ```
 
-## Notes
-
-- If OpenAI health fails (for example quota/rate-limit), the workflow can continue in deterministic fallback mode.
-- LangFuse is optional but enabled when LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY, and LANGFUSE_HOST are set.
-- If traces do not appear immediately, keep LANGFUSE_AUTO_FLUSH=1 and verify the process log for any "Langfuse disabled: missing required env var(s)" message.
-
 ## Git Hygiene
 
-- Runtime artifacts are ignored (for example cache snapshots, token usage, generated reports, and logs).
-- Keep only source, tests, and docs in commits.
-- Before push, run:
-
-```bash
-pytest -q
-```
+- `.env` and `.venv` are ignored.
+- Build artifacts (`*.o`, `*.exe`) and logs are ignored.
+- Always run tests before pushing: `pytest -q`.
 
 ## License
 
