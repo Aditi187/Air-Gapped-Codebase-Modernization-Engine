@@ -5,9 +5,18 @@ from typing import Any, Dict, Optional, OrderedDict
 from collections import OrderedDict
 
 from agents.workflow.config import WorkflowConfig
-from agents.workflow.infra.langfuse import TracingWrapper
 
 logger = logging.getLogger(__name__)
+
+
+class DummyTracer:
+    """No-op tracer to replace missing Langfuse infrastructure."""
+    def start_workflow_trace(self, *args, **kwargs): pass
+    def trace_event(self, *args, **kwargs): pass
+    def log_diagnostics(self, *args, **kwargs): pass
+    def start_span(self, *args, **kwargs): return self  # Span can be the tracer itself
+    def finish_span(self, *args, **kwargs): pass
+    def flush(self, *args, **kwargs): pass
 
 
 class WorkflowContext:
@@ -19,7 +28,7 @@ class WorkflowContext:
 
     def __init__(self, config: Optional[WorkflowConfig] = None):
         self.config = config or WorkflowConfig.from_env()
-        self.tracer = TracingWrapper()
+        self.tracer = DummyTracer()
         # Start a trace with a default project name; can be overridden later
         self.tracer.start_workflow_trace(project_name="air-gapped-engine")
 

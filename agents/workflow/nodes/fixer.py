@@ -4,10 +4,10 @@ from typing import Dict, Any, Tuple
 from agents.workflow.state import ModernizationState
 from agents.workflow.context import WorkflowContext
 from agents.workflow.infra.model_provider import ModelClient
-from core.logger import get_logger
+import logging
 from core.differential_tester import compile_cpp_source
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 _CODE_FENCE_RE = re.compile(r"```(?:cpp|c\+\+)?\s*\n?(.*?)```", re.DOTALL | re.IGNORECASE)
 

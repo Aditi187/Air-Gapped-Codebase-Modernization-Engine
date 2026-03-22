@@ -1,35 +1,38 @@
 # Air-Gapped Codebase Modernization Engine
 
-Modernizes legacy C++ code using a modular, node-based LangGraph workflow with LLM-backed intelligence and robust rule-based fallbacks.
+Modernizes legacy C/C++ code into idiomatic C++17 using a modular, intelligent LangGraph workflow powered by a Multi-Model LLM Bridge and deterministic rule fallbacks.
 
 ## Project Structure
 
 ```text
 agents/
-  workflow/         # New Modular Workflow System
-    nodes/          # Workflow steps (Analyzer, Modernizer, Verifier, Fixer, etc.)
-    infra/          # Infrastructure (Tracing, Model Provider, Exceptions)
-    validation/     # AST and Structural validation logic
+  workflow/         # Modular Workflow System
+    nodes/          # Workflow steps (Analyzer, Modernizer, Verifier, Fixer)
+    infra/          # Infrastructure (Model Provider multi-routing)
     orchestrator.py # State Graph Orchestration
-    cli.py          # Command Line Interface
-core/               # Core engines (Parser, RuleModernizer, Similarity, RAG)
-tools/              # Integration tools and MCP server
+core/               # Core engines (RuleModernizer for deterministic fallbacks)
+main.py             # Main Entry Point
 tests/              # Test suites
-cache/              # Runtime cache (Tokens, OpenAI, RAG)
 ```
 
 ## Overview
 
-The engine utilizes a state-graph architecture to transform legacy C++ into modern C++17. The pipeline follows a structured flow: **Analyze → Plan → Modernize (Parallel) → Verify → Fix (Surgical) → Test**.
+The engine utilizes a state-graph architecture to transform legacy C/C++ into modern C++17. The pipeline follows a structured flow: **Analyze → Plan → Transform (Full-File) → Verify → Fix**.
+
+### Multi-Model LLM Bridge
+The engine is highly optimized for production via Nvidia's API gateway, routing specific agents to specialized models:
+- **Analyzer:** `deepseek-v3` (for deep context extraction and planning)
+- **Modernizer:** `llama-3.3-70b-instruct` (for raw codebase transformation)
+- **Fixer:** `qwen3` (for fast iterative compiler error fixing)
+
+If the LLMs are unavailable or return malformed code, the engine instantly falls back to the deterministic `RuleModernizer` for entirely safe, prompt-independent transformations.
 
 ## Features
 
-- **Modular Node Architecture**: Scalable, maintainable workflow powered by LangGraph.
-- **Parallel Function Modernization**: Uses `ThreadPoolExecutor` for high-throughput batch processing.
-- **Hybrid Modernization**: Combines LLM intelligence with deterministic `RuleModernizer` fallbacks.
-- **Hierarchical Tracing**: Full project lifecycle observability via Langfuse (spans, events, and cost tracking).
-- **Advanced Validation**: AST-based structural checks and differential parity testing.
-- **RAII Enforcement**: Strict prompts ensuring modern memory management (`std::unique_ptr`, `std::vector`, `std::string`).
+- **Multi-Model Intelligence**: DeepSeek, Llama, and Qwen working in concert for optimal speed and accuracy via Nvidia API.
+- **Whole-File Processing**: Replaces fragile AST-based snippet injection with full-file context awareness.
+- **Rule-Based Fallbacks**: 100% deterministic regex transformations (`NULL` -> `nullptr`, `typedef` -> `using`) that function entirely offline in air-gapped modes.
+- **RAII Enforcement**: Automatically transforms C-style manual memory (`malloc`/`free`, manual structs) into RAII (`std::vector`, `std::unique_ptr`, idiomatic classes).
 
 ## Installation
 
@@ -45,40 +48,29 @@ The engine utilizes a state-graph architecture to transform legacy C++ into mode
 
 ## Configuration
 
-Copy [.env.example](.env.example) to `.env` and configure your API keys and model settings.
+Set up your API keys in the `.env` file for the multi-model bridge:
 
-```bash
-cp .env.example .env
+```env
+# Multi-agent model routing
+ANALYZER_MODEL=deepseek-ai/deepseek-v3.2
+ANALYZER_API_KEY=nvapi-...
+
+MODERNIZER_MODEL=meta/llama-3.3-70b-instruct
+MODERNIZER_API_KEY=nvapi-...
+
+FIXER_MODEL=meta/llama-70b-instruct
+FIXER_API_KEY=nvapi-...
 ```
-
-Key Variables:
-- `API_KEY`: Modernization LLM provider key (e.g., NVIDIA, OpenAI).
-- `LANGFUSE_SECRET_KEY`: Tracing dashboard key.
-- `WORKFLOW_BATCH_SIZE`: Number of functions to process in parallel.
 
 ## Usage
 
-### Run Modernization CLI
+Run the modernization engine directly on any C++ file:
 
 ```bash
-python -m agents.workflow.cli <path_to_file.cpp> --mode aggressive
+python main.py <path_to_file.cpp>
 ```
 
-- `--mode safe`: (Default) No signature changes.
-- `--mode aggressive`: Allows RAII-driven signature refactoring.
-- `--output`: Specify custom output path.
-
-### Run MCP Server (Integration)
-
-```bash
-python tools/mcp_server.py
-```
-
-## Git Hygiene
-
-- `.env` and `.venv` are ignored.
-- Build artifacts (`*.o`, `*.exe`) and logs are ignored.
-- Always run tests before pushing: `pytest -q`.
+The output will automatically be generated in the same directory as `<filename>_modernized.cpp`.
 
 ## License
 

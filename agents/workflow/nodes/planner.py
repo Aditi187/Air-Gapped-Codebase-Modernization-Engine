@@ -1,9 +1,9 @@
 from typing import Dict, Any, List
 from agents.workflow.state import ModernizationState
 from agents.workflow.context import WorkflowContext
-from core.logger import get_logger
+import logging
 
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 def planner_node(state: ModernizationState) -> ModernizationState:

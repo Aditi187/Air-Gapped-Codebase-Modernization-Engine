@@ -2,69 +2,166 @@
 #include <cstring>
 #include <cstdlib>
 
-class Student {
-public:
-    char* name;
-    int age;
+typedef struct Node
+{
+    int id;
+    char name[100];
+    struct Node* next;
 
-    Student(const char* n, int a) {
-        name = (char*)malloc(strlen(n) + 1);
-        strcpy(name, n);
-        age = a;
+} Node;
+
+
+typedef struct LinkedList
+{
+    Node* head;
+
+} LinkedList;
+
+
+void initList(LinkedList* list)
+{
+    list->head = NULL;
+}
+
+
+Node* createNode(int id, const char* name)
+{
+    Node* node = (Node*) malloc(sizeof(Node));
+
+    if(node == NULL)
+    {
+        std::cout << "Memory allocation failed\n";
+        exit(1);
     }
 
-    ~Student() {
-        free(name);
-    }
+    node->id = id;
 
-    void print() {
-        std::cout << "Name: " << name << ", Age: " << age << std::endl;
-    }
-};
+    strcpy(node->name, name);
 
-class StudentManager {
-private:
-    Student** students;
-    int size;
-    int capacity;
+    node->next = NULL;
 
-public:
-    StudentManager() {
-        size = 0;
-        capacity = 2;
-        students = (Student**)malloc(sizeof(Student*) * capacity);
-    }
+    return node;
+}
 
-    ~StudentManager() {
-        for (int i = 0; i < size; i++) {
-            delete students[i];
+
+void insertFront(LinkedList* list, int id, const char* name)
+{
+    Node* node = createNode(id, name);
+
+    node->next = list->head;
+
+    list->head = node;
+}
+
+
+Node* findNode(LinkedList* list, int id)
+{
+    Node* temp = list->head;
+
+    while(temp != NULL)
+    {
+        if(temp->id == id)
+        {
+            return temp;
         }
-        free(students);
+
+        temp = temp->next;
     }
 
-    void addStudent(const char* name, int age) {
-        if (size == capacity) {
-            capacity *= 2;
-            students = (Student**)realloc(students, sizeof(Student*) * capacity);
+    return NULL;
+}
+
+
+void deleteNode(LinkedList* list, int id)
+{
+    Node* current = list->head;
+
+    Node* prev = NULL;
+
+    while(current != NULL)
+    {
+        if(current->id == id)
+        {
+            if(prev == NULL)
+            {
+                list->head = current->next;
+            }
+            else
+            {
+                prev->next = current->next;
+            }
+
+            free(current);
+
+            return;
         }
-        students[size++] = new Student(name, age);
+
+        prev = current;
+
+        current = current->next;
+    }
+}
+
+
+void printList(LinkedList* list)
+{
+    Node* temp = list->head;
+
+    while(temp != NULL)
+    {
+        std::cout << temp->id << " "
+                  << temp->name << std::endl;
+
+        temp = temp->next;
+    }
+}
+
+
+void freeList(LinkedList* list)
+{
+    Node* temp = list->head;
+
+    while(temp != NULL)
+    {
+        Node* next = temp->next;
+
+        free(temp);
+
+        temp = next;
     }
 
-    void printAll() {
-        for (int i = 0; i < size; i++) {
-            students[i]->print();
-        }
+    list->head = NULL;
+}
+
+
+int main()
+{
+    LinkedList list;
+
+    initList(&list);
+
+    insertFront(&list, 1, "Alice");
+
+    insertFront(&list, 2, "Bob");
+
+    insertFront(&list, 3, "Charlie");
+
+    printList(&list);
+
+    Node* result = findNode(&list, 2);
+
+    if(result != NULL)
+    {
+        std::cout << "Found: "
+                  << result->name
+                  << std::endl;
     }
-};
 
-int main() {
-    StudentManager manager;
+    deleteNode(&list, 1);
 
-    manager.addStudent("Alice", 20);
-    manager.addStudent("Bob", 22);
-    manager.addStudent("Charlie", 21);
+    printList(&list);
 
-    manager.printAll();
+    freeList(&list);
 
     return 0;
 }
