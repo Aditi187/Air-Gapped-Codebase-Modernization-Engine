@@ -1,167 +1,45 @@
-#include <iostream>
-#include <cstring>
-#include <cstdlib>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
 
-typedef struct Node
-{
-    int id;
-    char name[100];
-    struct Node* next;
+typedef struct Logger {
+    FILE* file;
+    char* buffer;
+} Logger;
 
-} Node;
-
-
-typedef struct LinkedList
-{
-    Node* head;
-
-} LinkedList;
-
-
-void initList(LinkedList* list)
-{
-    list->head = NULL;
+void init_logger(Logger* l, const char* filename) {
+    l->file = fopen(filename, "a");
+    l->buffer = (char*)malloc(1024); // Manual buffer
 }
 
-
-Node* createNode(int id, const char* name)
-{
-    Node* node = (Node*) malloc(sizeof(Node));
-
-    if(node == NULL)
-    {
-        std::cout << "Memory allocation failed\n";
-        exit(1);
-    }
-
-    node->id = id;
-
-    strcpy(node->name, name);
-
-    node->next = NULL;
-
-    return node;
-}
-
-
-void insertFront(LinkedList* list, int id, const char* name)
-{
-    Node* node = createNode(id, name);
-
-    node->next = list->head;
-
-    list->head = node;
-}
-
-
-Node* findNode(LinkedList* list, int id)
-{
-    Node* temp = list->head;
-
-    while(temp != NULL)
-    {
-        if(temp->id == id)
-        {
-            return temp;
-        }
-
-        temp = temp->next;
-    }
-
-    return NULL;
-}
-
-
-void deleteNode(LinkedList* list, int id)
-{
-    Node* current = list->head;
-
-    Node* prev = NULL;
-
-    while(current != NULL)
-    {
-        if(current->id == id)
-        {
-            if(prev == NULL)
-            {
-                list->head = current->next;
-            }
-            else
-            {
-                prev->next = current->next;
-            }
-
-            free(current);
-
-            return;
-        }
-
-        prev = current;
-
-        current = current->next;
+void log_message(Logger* l, const char* msg) {
+    if (l->file) {
+        time_t rawtime;
+        struct tm* timeinfo;
+        time(&rawtime);
+        timeinfo = localtime(&rawtime);
+        
+        fprintf(l->file, "[%d:%d:%d] %s\n", 
+                timeinfo->tm_hour, timeinfo->tm_min, timeinfo->tm_sec, msg);
+        fflush(l->file);
     }
 }
 
-
-void printList(LinkedList* list)
-{
-    Node* temp = list->head;
-
-    while(temp != NULL)
-    {
-        std::cout << temp->id << " "
-                  << temp->name << std::endl;
-
-        temp = temp->next;
+void close_logger(Logger* l) {
+    if (l->file) {
+        fclose(l->file);
+    }
+    if (l->buffer) {
+        free(l->buffer);
     }
 }
 
-
-void freeList(LinkedList* list)
-{
-    Node* temp = list->head;
-
-    while(temp != NULL)
-    {
-        Node* next = temp->next;
-
-        free(temp);
-
-        temp = next;
-    }
-
-    list->head = NULL;
-}
-
-
-int main()
-{
-    LinkedList list;
-
-    initList(&list);
-
-    insertFront(&list, 1, "Alice");
-
-    insertFront(&list, 2, "Bob");
-
-    insertFront(&list, 3, "Charlie");
-
-    printList(&list);
-
-    Node* result = findNode(&list, 2);
-
-    if(result != NULL)
-    {
-        std::cout << "Found: "
-                  << result->name
-                  << std::endl;
-    }
-
-    deleteNode(&list, 1);
-
-    printList(&list);
-
-    freeList(&list);
-
+int main() {
+    Logger myLogger;
+    init_logger(&myLogger, "app.log");
+    log_message(&myLogger, "System started");
+    log_message(&myLogger, "Processing data...");
+    close_logger(&myLogger);
     return 0;
 }

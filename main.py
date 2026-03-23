@@ -1,3 +1,4 @@
+
 """
 Entry point for the Air-Gapped C++ Modernization Engine.
 
@@ -6,15 +7,13 @@ Usage:
 
 Loads .env automatically, then runs the full multi-model modernization workflow.
 """
-import sys
-import os
-
 # Load .env before anything else so all API keys / config are in the environment
+import os
+import sys
 try:
     from dotenv import load_dotenv
-    load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"), override=False)
+    load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"), override=True)
 except ImportError:
-    # dotenv is optional — env vars may already be set in the shell
     pass
 
 from agents.workflow.orchestrator import run_modernization_workflow
