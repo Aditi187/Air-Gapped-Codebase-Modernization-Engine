@@ -58,9 +58,12 @@ ANALYZER_API_KEY=nvapi-...
 MODERNIZER_MODEL=meta/llama-3.3-70b-instruct
 MODERNIZER_API_KEY=nvapi-...
 
-FIXER_MODEL=meta/llama-70b-instruct
+FIXER_MODEL=qwen/qwen3-235b-a22b
 FIXER_API_KEY=nvapi-...
 ```
+
+## Usage
+
 
 ## Usage
 
@@ -70,7 +73,19 @@ Run the modernization engine directly on any C++ file:
 python main.py <path_to_file.cpp>
 ```
 
-The output will automatically be generated in the same directory as `<filename>_modernized.cpp`.
+The output will automatically be generated as `<filename>_modernized.cpp` in the same directory.
+
+## Git Workflow
+
+To contribute or update your fork:
+
+```bash
+git add .
+git commit -m "Describe your changes"
+git push origin main
+```
+
+For more, see the [GitHub repository](https://github.com/Aditi187/Air-Gapped-Codebase-Modernization-Engine).
 
 ## License
 
