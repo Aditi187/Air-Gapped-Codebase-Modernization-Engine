@@ -124,428 +124,117 @@ class PlannerStrategy(str, Enum):
 
 @dataclass
 class WorkflowConfig:
-
-    # ======================================================
-    # MODEL SETTINGS
-    # ======================================================
-
+    # Model Settings
     use_llm: bool = True
-
     model_name: str = "gpt-4-turbo"
-
     temperature: float = 0.2
-
     enable_multi_model: bool = False
-
+    
+    # Provider Specialization
     analyzer_model: Optional[str] = None
-
     planner_model: Optional[str] = None
-
     modernizer_model: Optional[str] = None
-
     fixer_model: Optional[str] = None
 
-
-    # ======================================================
-    # LOOP CONTROL
-    # ======================================================
-
+    # Loop Control
     max_attempts: int = 3
-
     max_fix_attempts: int = 2
-
     planner_max_iterations: int = 2
 
-
-    # ======================================================
-    # CORE FEATURES
-    # ======================================================
-
+    # Feature Toggles
     enable_planner: bool = True
-
     enable_semantic_guard: bool = True
-
     enable_code_graph: bool = True
-
     enable_risk_analysis: bool = True
 
-
-    # ======================================================
-    # MODERNIZATION STRATEGY
-    # ======================================================
-
+    # Modernization Policy
     modernization_mode: ModernizationMode = ModernizationMode.SAFE
-
     planner_strategy: PlannerStrategy = PlannerStrategy.RISK_AWARE
-
     transformation_depth: int = 2
-
-    """
-    1 → syntax only
-    2 → ownership changes
-    3 → structural refactors
-    """
-
-
-    # ======================================================
-    # RISK CONTROL
-    # ======================================================
-
     max_allowed_risk: float = 0.7
-
     semantic_strict_mode: bool = True
 
-
-    # ======================================================
-    # RULE FLAGS
-    # ======================================================
-
+    # Rule Flags
     enable_pointer_modernization: bool = True
-
     enable_string_modernization: bool = True
-
     enable_container_modernization: bool = True
-
     enable_loop_modernization: bool = True
-
     enable_include_cleanup: bool = True
-
     enable_nullptr_upgrade: bool = True
-
     enable_auto_keyword: bool = True
-
     enable_template_refactoring: bool = False
-
     enable_interface_extraction: bool = False
 
-
-    # ======================================================
-    # GRAPH SETTINGS
-    # ======================================================
-
+    # Graph & Metrics
     graph_max_nodes: int = 5000
-
     graph_include_headers: bool = True
-
-
-    # ======================================================
-    # DEBUGGING
-    # ======================================================
-
     enable_metrics: bool = True
-
+    
+    # Logging
     log_plans: bool = True
-
     log_graph: bool = False
-
     log_transformations: bool = True
-
-
-    # ======================================================
-    # ENV LOADER
-    # ======================================================
 
     @classmethod
     def from_env(cls) -> "WorkflowConfig":
+        """
+        Loads configuration from environment variables with sensible defaults.
+        """
+        def get_mode():
+            val = os.getenv("MODERNIZATION_MODE", "safe").lower()
+            try:
+                return ModernizationMode(val)
+            except ValueError:
+                return ModernizationMode.SAFE
 
-        mode_str = os.getenv(
-
-            "MODERNIZATION_MODE",
-
-            "safe"
-        ).lower()
-
-        try:
-
-            mode = ModernizationMode(mode_str)
-
-        except ValueError:
-
-            logger.warning(
-
-                f"Invalid MODERNIZATION_MODE: {mode_str}"
-
-            )
-
-            mode = ModernizationMode.SAFE
-
-
-        planner_str = os.getenv(
-
-            "PLANNER_STRATEGY",
-
-            "risk_aware"
-        ).lower()
-
-        try:
-
-            planner_strategy = PlannerStrategy(
-
-                planner_str
-            )
-
-        except ValueError:
-
-            planner_strategy = PlannerStrategy.RISK_AWARE
-
+        def get_strategy():
+            val = os.getenv("PLANNER_STRATEGY", "risk_aware").lower()
+            try:
+                return PlannerStrategy(val)
+            except ValueError:
+                return PlannerStrategy.RISK_AWARE
 
         return cls(
-
-            # model
-            use_llm=_read_bool_env(
-
-                "USE_LLM",
-
-                True
-            ),
-
-            model_name=os.getenv(
-
-                "LLM_MODEL",
-
-                "gpt-4-turbo"
-            ),
-
-            temperature=_read_float_env(
-
-                "LLM_TEMPERATURE",
-
-                0.2,
-
-                0.0,
-
-                1.0
-            ),
-
-            enable_multi_model=_read_bool_env(
-
-                "MULTI_MODEL",
-
-                False
-            ),
-
-            analyzer_model=os.getenv(
-
-                "ANALYZER_MODEL"
-            ),
-
-            planner_model=os.getenv(
-
-                "PLANNER_MODEL"
-            ),
-
-            modernizer_model=os.getenv(
-
-                "MODERNIZER_MODEL"
-            ),
-
-            fixer_model=os.getenv(
-
-                "FIXER_MODEL"
-            ),
-
-            # loops
-            max_attempts=_read_int_env(
-
-                "MAX_ATTEMPTS",
-
-                3,
-
-                1,
-
-                10
-            ),
-
-            max_fix_attempts=_read_int_env(
-
-                "MAX_FIX_ATTEMPTS",
-
-                2,
-
-                0,
-
-                6
-            ),
-
-            planner_max_iterations=_read_int_env(
-
-                "PLANNER_MAX_ITER",
-
-                2,
-
-                1,
-
-                5
-            ),
-
-            # features
-            enable_planner=_read_bool_env(
-
-                "ENABLE_PLANNER",
-
-                True
-            ),
-
-            enable_semantic_guard=_read_bool_env(
-
-                "ENABLE_SEMANTIC_GUARD",
-
-                True
-            ),
-
-            enable_code_graph=_read_bool_env(
-
-                "ENABLE_GRAPH",
-
-                True
-            ),
-
-            enable_risk_analysis=_read_bool_env(
-
-                "ENABLE_RISK",
-
-                True
-            ),
-
-            modernization_mode=mode,
-
-            planner_strategy=planner_strategy,
-
-            transformation_depth=_read_int_env(
-
-                "TRANSFORMATION_DEPTH",
-
-                2,
-
-                1,
-
-                3
-            ),
-
-            max_allowed_risk=_read_float_env(
-
-                "MAX_ALLOWED_RISK",
-
-                0.7,
-
-                0.0,
-
-                1.0
-            ),
-
-            semantic_strict_mode=_read_bool_env(
-
-                "SEMANTIC_STRICT",
-
-                True
-            ),
-
-            enable_pointer_modernization=_read_bool_env(
-
-                "MOD_POINTERS",
-
-                True
-            ),
-
-            enable_string_modernization=_read_bool_env(
-
-                "MOD_STRING",
-
-                True
-            ),
-
-            enable_container_modernization=_read_bool_env(
-
-                "MOD_CONTAINERS",
-
-                True
-            ),
-
-            enable_loop_modernization=_read_bool_env(
-
-                "MOD_LOOPS",
-
-                True
-            ),
-
-            enable_include_cleanup=_read_bool_env(
-
-                "MOD_INCLUDES",
-
-                True
-            ),
-
-            enable_nullptr_upgrade=_read_bool_env(
-
-                "MOD_NULLPTR",
-
-                True
-            ),
-
-            enable_auto_keyword=_read_bool_env(
-
-                "MOD_AUTO",
-
-                True
-            ),
-
-            enable_template_refactoring=_read_bool_env(
-
-                "MOD_TEMPLATES",
-
-                False
-            ),
-
-            enable_interface_extraction=_read_bool_env(
-
-                "MOD_INTERFACE",
-
-                False
-            ),
-
-            graph_max_nodes=_read_int_env(
-
-                "GRAPH_MAX_NODES",
-
-                5000,
-
-                100,
-
-                20000
-            ),
-
-            graph_include_headers=_read_bool_env(
-
-                "GRAPH_HEADERS",
-
-                True
-            ),
-
-            enable_metrics=_read_bool_env(
-
-                "ENABLE_METRICS",
-
-                True
-            ),
-
-            log_plans=_read_bool_env(
-
-                "LOG_PLANS",
-
-                True
-            ),
-
-            log_graph=_read_bool_env(
-
-                "LOG_GRAPH",
-
-                False
-            ),
-
-            log_transformations=_read_bool_env(
-
-                "LOG_TRANSFORMS",
-
-                True
-            ),
-        )
+            use_llm=_read_bool_env("USE_LLM", True),
+            model_name=os.getenv("LLM_MODEL", "gpt-4-turbo"),
+            temperature=_read_float_env("LLM_TEMPERATURE", 0.2, 0.0, 1.0),
+            enable_multi_model=_read_bool_env("MULTI_MODEL", False),
+            
+            analyzer_model=os.getenv("ANALYZER_MODEL"),
+            planner_model=os.getenv("PLANNER_MODEL"),
+            modernizer_model=os.getenv("MODERNIZER_MODEL"),
+            fixer_model=os.getenv("FIXER_MODEL"),
+
+            max_attempts=_read_int_env("MAX_ATTEMPTS", 3, 1, 10),
+            max_fix_attempts=_read_int_env("MAX_FIX_ATTEMPTS", 2, 0, 6),
+            planner_max_iterations=_read_int_env("PLANNER_MAX_ITER", 2, 1, 5),
+
+            enable_planner=_read_bool_env("ENABLE_PLANNER", True),
+            enable_semantic_guard=_read_bool_env("ENABLE_SEMANTIC_GUARD", True),
+            enable_code_graph=_read_bool_env("ENABLE_GRAPH", True),
+            enable_risk_analysis=_read_bool_env("ENABLE_RISK", True),
+
+            modernization_mode=get_mode(),
+            planner_strategy=get_strategy(),
+            transformation_depth=_read_int_env("TRANSFORMATION_DEPTH", 2, 1, 3),
+            max_allowed_risk=_read_float_env("MAX_ALLOWED_RISK", 0.7, 0.0, 1.0),
+            semantic_strict_mode=_read_bool_env("SEMANTIC_STRICT", True),
+
+            enable_pointer_modernization=_read_bool_env("MOD_POINTERS", True),
+            enable_string_modernization=_read_bool_env("MOD_STRING", True),
+            enable_container_modernization=_read_bool_env("MOD_CONTAINERS", True),
+            enable_loop_modernization=_read_bool_env("MOD_LOOPS", True),
+            enable_include_cleanup=_read_bool_env("MOD_INCLUDES", True),
+            enable_nullptr_upgrade=_read_bool_env("MOD_NULLPTR", True),
+            enable_auto_keyword=_read_bool_env("MOD_AUTO", True),
+            enable_template_refactoring=_read_bool_env("MOD_TEMPLATES", False),
+            enable_interface_extraction=_read_bool_env("MOD_INTERFACE", False),
+
+            graph_max_nodes=_read_int_env("GRAPH_MAX_NODES", 5000, 100, 20000),
+            graph_include_headers=_read_bool_env("GRAPH_HEADERS", True),
+            enable_metrics=_read_bool_env("ENABLE_METRICS", True),
+
+            log_plans=_read_bool_env("LOG_PLANS", True),
+            log_graph=_read_bool_env("LOG_GRAPH", False),
+            log_transformations=_read_bool_env("LOG_TRANSFORMS", True),
+        )
