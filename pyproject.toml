@@ -22,7 +22,10 @@ dependencies = [
     "pydantic",
     "requests",
     "python-dotenv",
+    "fastapi",
+    "uvicorn",
 ]
+
 
 [project.optional-dependencies]
 dev = [
