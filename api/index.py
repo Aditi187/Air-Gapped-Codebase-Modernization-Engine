@@ -52,29 +52,23 @@ async def root():
 async def health():
     return {"status": "healthy"}
 
+from agents.workflow.orchestrator import run_modernization_workflow, run_lite_modernization
+
+# ... (inside modernize function)
 @app.post("/modernize")
 async def modernize(request: ModernizationRequest):
     """
     Triggers the modernization workflow for the provided C++ code.
     """
     try:
-        # We use a temporary or virtual path for the source file in serverless envs
-        source_file = request.source_file or "api_input.cpp"
-        
-        # Run the workflow
-        # Note: orchestrator writes to file, but we'll return the result code in JSON
-        result_state = run_modernization_workflow(
+        # For Vercel Hobby, we use Lite mode to avoid 10s timeout
+        # If the user wants full power, they should run locally or on a Pro plan
+        result = run_lite_modernization(
             code=request.code,
-            source_file=source_file,
-            output_path=request.output_path
+            source_file=request.source_file or "api_input.cpp"
         )
         
-        return {
-            "success": True,
-            "modernized_code": result_state.get("modernized_code", ""),
-            "analysis": result_state.get("analysis_report", ""),
-            "plan": result_state.get("plan_id", ""),
-            "attempt_count": result_state.get("attempt_count", 0)
-        }
+        return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+

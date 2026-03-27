@@ -127,3 +127,25 @@ def run_modernization_workflow(
         logger.error("Workflow did not return a valid state dict. Returning initial state.")
         return initial_state
     return ModernizationState(**final_state)
+
+def run_lite_modernization(code: str, source_file: str) -> dict:
+    """
+    A single-pass modernization for serverless environments with tight timeouts.
+    Skips analysis, planning, and verification.
+    """
+    from agents.workflow.state import create_initial_state
+    from agents.workflow.context import WorkflowContext
+    from agents.workflow.nodes.modernizer import modernizer_node
+    
+    ctx = WorkflowContext()
+    state = create_initial_state(code, source_file, context=ctx)
+    
+    # Execute only the modernizer node
+    result_state = modernizer_node(state)
+    
+    return {
+        "success": True,
+        "modernized_code": result_state.get("modernized_code", code),
+        "analysis": "Lite mode: Analysis skipped for speed.",
+        "attempt_count": 1
+    }
