@@ -1,8 +1,6 @@
-"""
-Modernizer node — applies deterministic C++17 transformations to the full source file.
-Production-grade: minimal code, maximum efficiency, no LLM required in air-gapped mode.
-"""
 import logging
+from typing import Dict, Any, Optional
+
 from agents.workflow.state import ModernizationState
 from agents.workflow.context import WorkflowContext
 from agents.workflow.infra.model_provider import ModelClient
@@ -10,90 +8,61 @@ from core.rule_modernizer import RuleModernizer
 
 logger = logging.getLogger(__name__)
 
-_rule_engine = RuleModernizer()
+def extract_code(text: str) -> str:
+    """
+    Extracts code from markdown fences if present.
+    """
+    match = re.search(r"```(?:cpp|c\+\+)?\s*\n?(.*?)```", text, re.DOTALL | re.IGNORECASE)
+    if match:
+        return match.group(1).strip()
+    return text.strip()
 
+import re
 
 def modernizer_node(state: ModernizationState) -> ModernizationState:
-    logger.info("\n⚙️  MODERNIZER NODE")
-
+    """
+    Phase 4 modernizer.
+    Using LLM with 'perfect' C++17 prompts.
+    """
+    logger.info(">>> [MODERNIZER] Executing C++17 transformation phase via LLM")
     context: WorkflowContext = state.get("context")
     if not context:
-        logger.error("No WorkflowContext in state")
+        logger.error("[modernizer] missing workflow context")
         return state
 
-    source = (
-        state.get("modernized_code")
-        or state.get("last_working_code")
-        or state.get("code")
-        or ""
-    ).strip()
-
-    if not source:
-        logger.warning("No source code to modernize")
-        return state
-
-    # --- Try LLM first (if configured), else fall back to rule engine ---
+    source = state.get("code", "")
     client = ModelClient(context)
-    modernized = None
+    
+    prompt = (
+        "Modernize this C++ file to PERFECT C++17 standards.\n"
+        "MANDATORY REQUIREMENTS:\n"
+        "1. Use RAII for all resource management (smart pointers, containers, file streams).\n"
+        "2. Use 'mutable' for logical const-ness in member variables (e.g., mutable std::ofstream) to allow logging from const methods.\n"
+        "3. Use 'std::string_view' for read-only string parameters for maximum efficiency.\n"
+        "4. Use thread-safe 'localtime_s' (Windows style) or 'localtime_r' (POSIX style) for time conversion.\n"
+        "5. Replicate legacy formatting character-for-character relative to original output (check printf/fprintf calls).\n"
+        "6. Use nullptr, auto, and range-based for loops.\n"
+        "Return ONLY valid C++17 code, no markdown fences, no explanation.\n\n"
+        f"Source to Modernize:\n```cpp\n{source}\n```"
+    )
 
-    if context.config.use_llm:
-        prompt = (
-            "Rewrite this entire C++ file to modern C++17.\n"
-            "Use RAII, std::unique_ptr, std::string, nullptr, range-based for, auto.\n"
-            "Return ONLY valid C++ code, no explanation, no markdown fences.\n\n"
-            f"```cpp\n{source}\n```"
+    try:
+        raw_output = client.call(
+            "You are AGENT 2: MODERNIZER. Convert legacy C++ to idiomatic C++17. Output valid code only.",
+            prompt,
+            role="modernizer"
         )
-        try:
-            raw = client.call(
-                "You are a C++17 modernization engine. Return ONLY valid C++17 code.",
-                prompt,
-                role="modernizer",
-            )
-            if raw and raw.strip() and raw.strip() != "NO_CHANGE":
-                modernized = raw.strip()
-                logger.info("LLM modernization applied.")
-        except Exception as e:
-            logger.warning(f"LLM call failed, falling back to rules: {e}")
-
-    if not modernized:
-        # Deterministic rule engine — always safe
-        modernized = _rule_engine.modernize_text(source)
-        logger.info("RuleModernizer applied.")
-
-    # Auto-inject any missing standard headers
-    modernized = _auto_inject_includes(modernized)
-
-    state["modernized_code"] = modernized
-    state["attempt_count"] = state.get("attempt_count", 0) + 1
-    # Mark all functions as processed so the orchestrator moves on
-    order = state.get("modernization_order") or []
-    state["current_function_index"] = len(order)
+        if raw_output:
+            modernized = extract_code(raw_output)
+            state["modernized_code"] = modernized
+            logger.info(">>> [MODERNIZER] LLM-based modernization successful.")
+        else:
+            logger.warning(">>> [MODERNIZER] LLM returned empty output; invoking RuleModernizer safety fallback.")
+            rm = RuleModernizer()
+            state["modernized_code"] = rm.modernize(source)
+    except Exception as e:
+        logger.error(f"[modernizer] LLM call failed: {e}. Using RuleModernizer fallback.")
+        rm = RuleModernizer()
+        state["modernized_code"] = rm.modernize(source)
 
     return state
-
-
-def _auto_inject_includes(source: str) -> str:
-    import re
-    existing = set(re.findall(r'#include\s*[<"]([^>"]+)[>"]', source))
-    needed = []
-    checks = {
-        "memory":   ("std::unique_ptr", "std::shared_ptr", "std::make_unique"),
-        "string":   ("std::string",),
-        "vector":   ("std::vector",),
-        "array":    ("std::array",),
-        "optional": ("std::optional",),
-        "iostream": ("std::cout", "std::cerr", "std::cin"),
-    }
-    for header, tokens in checks.items():
-        if header not in existing and any(t in source for t in tokens):
-            needed.append(f"#include <{header}>")
-    if not needed:
-        return source
-    lines = source.splitlines()
-    idx = 0
-    for i, line in enumerate(lines):
-        if line.strip().startswith("#include"):
-            idx = i + 1
-    for inc in reversed(needed):
-        lines.insert(idx, inc)
-    return "\n".join(lines)

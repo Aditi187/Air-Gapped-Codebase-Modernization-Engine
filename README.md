@@ -1,91 +1,72 @@
 # Air-Gapped Codebase Modernization Engine
 
-Modernizes legacy C/C++ code into idiomatic C++17 using a modular, intelligent LangGraph workflow powered by a Multi-Model LLM Bridge and deterministic rule fallbacks.
+Modernizes legacy C/C++ code into idiomatic C++17 using a modular, high-stability LangGraph workflow powered by a Multi-Model LLM bridge with deterministic rule fallbacks.
+
+## Project Overview
+
+The engine utilizes a state-graph architecture to transform legacy C++ into modern C++17. The pipeline follows a structured "Phase 4" flow: **Analyze → Plan → Modernize → Semantic Guard → Verify → Fix**.
+
+### Multi-Model LLM Strategy
+The engine is optimized for the NVIDIA API gateway, routing specialized agents to advanced models:
+- **Analyzer/Planner:** `meta/llama-3.3-70b-instruct` or `deepseek-ai/deepseek-v3`
+- **Modernizer/Fixer:** `meta/llama-3.3-70b-instruct`
+
+High-stability logic is built-in: the engine performs **15 retry attempts** with a mandatory **60-second delay** between calls to ensure resilience against API rate limits (429 errors).
+
+## Core C++17 Features
+
+The engine specializes in "Perfect" C++17 modernization:
+- **RAII Enforcement**: Replaces `malloc`/`free` and manual memory with `std::vector`, `std::unique_ptr`, and smart resource management.
+- **Logical Const-ness**: Identifies member variables needing `mutable` to allow logging/caching from `const` methods.
+- **Efficiency**: Upgrades read-only string handles to `std::string_view`.
+- **Thread Safety**: Replaces non-thread-safe C time functions with `localtime_s` (Windows) or `localtime_r` (POSIX).
 
 ## Project Structure
 
 ```text
 agents/
   workflow/         # Modular Workflow System
-    nodes/          # Workflow steps (Analyzer, Modernizer, Verifier, Fixer)
-    infra/          # Infrastructure (Model Provider multi-routing)
+    nodes/          # Workflow steps (Analyzer, Modernizer, Verifier, etc.)
+    infra/          # Infrastructure (Model Provider & LLM bridge)
     orchestrator.py # State Graph Orchestration
-core/               # Core engines (RuleModernizer for deterministic fallbacks)
-main.py             # Main Entry Point
-tests/              # Test suites
+core/               # Core engines (RuleModernizer for fallbacks, Differential Tester)
+main.py             # Main CLI Entry Point
+test.cpp            # Sample Legacy Input
+test_modernized.cpp # Sample Modernized Output
 ```
-
-## Overview
-
-The engine utilizes a state-graph architecture to transform legacy C/C++ into modern C++17. The pipeline follows a structured flow: **Analyze → Plan → Transform (Full-File) → Verify → Fix**.
-
-### Multi-Model LLM Bridge
-The engine is highly optimized for production via Nvidia's API gateway, routing specific agents to specialized models:
-- **Analyzer:** `deepseek-v3` (for deep context extraction and planning)
-- **Modernizer:** `llama-3.3-70b-instruct` (for raw codebase transformation)
-- **Fixer:** `qwen3` (for fast iterative compiler error fixing)
-
-If the LLMs are unavailable or return malformed code, the engine instantly falls back to the deterministic `RuleModernizer` for entirely safe, prompt-independent transformations.
-
-## Features
-
-- **Multi-Model Intelligence**: DeepSeek, Llama, and Qwen working in concert for optimal speed and accuracy via Nvidia API.
-- **Whole-File Processing**: Replaces fragile AST-based snippet injection with full-file context awareness.
-- **Rule-Based Fallbacks**: 100% deterministic regex transformations (`NULL` -> `nullptr`, `typedef` -> `using`) that function entirely offline in air-gapped modes.
-- **RAII Enforcement**: Automatically transforms C-style manual memory (`malloc`/`free`, manual structs) into RAII (`std::vector`, `std::unique_ptr`, idiomatic classes).
 
 ## Installation
 
 1. Create a virtual environment:
-   ```bash
+   ```powershell
    python -m venv .venv
-   .venv\Scripts\activate
+   .\.venv\Scripts\activate
    ```
-2. Install dependencies:
-   ```bash
+2. Install minimal dependencies:
+   ```powershell
    pip install -r requirements.txt
    ```
 
+## Usage
+
+Run the modernization engine on any C++ file:
+
+```powershell
+.\.venv\Scripts\python.exe main.py <path_to_file.cpp>
+```
+
+The modernized result will be saved as `<filename>_modernized.cpp`.
+
 ## Configuration
 
-Set up your API keys in the `.env` file for the multi-model bridge:
+Configure your `.env` file with your NVIDIA API key and preferred models:
 
 ```env
-# Multi-agent model routing
-ANALYZER_MODEL=deepseek-ai/deepseek-v3.2
-ANALYZER_API_KEY=nvapi-...
-
+NVIDIA_API_KEY=nvapi-...
+LLM_MODEL=meta/llama-3.3-70b-instruct
 MODERNIZER_MODEL=meta/llama-3.3-70b-instruct
-MODERNIZER_API_KEY=nvapi-...
-
-FIXER_MODEL=qwen/qwen3-235b-a22b
-FIXER_API_KEY=nvapi-...
+FIXER_MODEL=meta/llama-3.3-70b-instruct
 ```
-
-## Usage
-
-
-## Usage
-
-Run the modernization engine directly on any C++ file:
-
-```bash
-python main.py <path_to_file.cpp>
-```
-
-The output will automatically be generated as `<filename>_modernized.cpp` in the same directory.
-
-## Git Workflow
-
-To contribute or update your fork:
-
-```bash
-git add .
-git commit -m "Describe your changes"
-git push origin main
-```
-
-For more, see the [GitHub repository](https://github.com/Aditi187/Air-Gapped-Codebase-Modernization-Engine).
 
 ## License
 

@@ -1,88 +1,333 @@
-import logging
 import re
+import logging
 from typing import Dict, Any, List
+
 from agents.workflow.state import ModernizationState
-from agents.workflow.context import WorkflowContext
+
 
 logger = logging.getLogger(__name__)
 
-# Minimal regex-based parser stub since core.parser is deleted
-class CppParser:
-    def parse_string(self, code: str, language: str = "cpp") -> list:
-        # Simple regex to find class blocks for demonstration
-        classes = re.findall(r"(class\s+(\w+)\s*\{[\s\S]*?\};)", code)
-        functions = []
-        for full_match, name in classes:
-            start_off = code.find(full_match)
-            end_off = start_off + len(full_match)
-            functions.append({
-                "name": name,
-                "range": (start_off, end_off),
-                "start_byte": start_off,
-                "end_byte": end_off,
-                "source": full_match
-            })
-        return functions
 
-def detect_legacy_patterns(code: str) -> list:
-    patterns = []
-    if "malloc" in code: patterns.append("C-style allocation")
-    if "free" in code: patterns.append("C-style deallocation")
-    if "char*" in code: patterns.append("Raw character pointers")
-    return patterns
+# ==========================================================
+# HELPERS
+# ==========================================================
 
-# Stub out missing graph components
-class DependencyGraph:
-    def __init__(self, functions): self.functions = functions
-    def build_map(self): return {}
-    def get_call_graph(self): return {}
-    def get_orphans(self): return []
-    def get_cycles(self): return []
+def _detect_memory_patterns(code: str) -> List[str]:
 
-def build_analysis_report(graph):
-    return "Analysis report unavailable (core.graph deleted)"
+    findings = []
 
-def analyzer_node(state: ModernizationState) -> ModernizationState:
-    """Perform static analysis on the source code."""
-    logger.info("\n🔍 ANALYZER NODE")
-    
-    code = state.get("modernized_code") or state.get("code", "")
+    if "malloc" in code:
+
+        findings.append(
+
+            "malloc usage detected"
+        )
+
+    if "free(" in code:
+
+        findings.append(
+
+            "free usage detected"
+        )
+
+    if "new " in code:
+
+        findings.append(
+
+            "raw new detected"
+        )
+
+    if "delete " in code:
+
+        findings.append(
+
+            "manual delete detected"
+        )
+
+    return findings
+
+
+# ==========================================================
+
+def _detect_cstyle_patterns(code: str) -> List[str]:
+
+    findings = []
+
+    if "FILE*" in code:
+
+        findings.append(
+
+            "c-style file api detected"
+        )
+
+    if "printf(" in code:
+
+        findings.append(
+
+            "printf usage detected"
+        )
+
+    if "strcpy(" in code:
+
+        findings.append(
+
+            "strcpy usage detected"
+        )
+
+    if re.search(r"\w+\s+\w+\[\d+\]", code):
+
+        findings.append(
+
+            "c-style array detected"
+        )
+
+    return findings
+
+
+# ==========================================================
+
+def _detect_structural_patterns(code: str) -> List[str]:
+
+    findings = []
+
+    if "typedef" in code:
+
+        findings.append(
+
+            "typedef detected"
+        )
+
+    if "#define" in code:
+
+        findings.append(
+
+            "macro usage detected"
+        )
+
+    if "NULL" in code:
+
+        findings.append(
+
+            "NULL detected"
+        )
+
+    if "using namespace std" in code:
+
+        findings.append(
+
+            "global namespace usage"
+        )
+
+    return findings
+
+
+# ==========================================================
+
+def _extract_functions(code: str) -> List[str]:
+
+    """
+    basic function name extraction
+    """
+
+    pattern = re.compile(
+
+        r"\b([A-Za-z_]\w*)\s*\([^)]*\)\s*\{"
+
+    )
+
+    return list(
+
+        set(pattern.findall(code))
+    )
+
+
+# ==========================================================
+# NODE
+# ==========================================================
+
+def analyzer_node(
+
+    state: ModernizationState
+
+) -> ModernizationState:
+
+    """
+    Phase 4 analyzer.
+
+    responsibilities:
+
+        detect legacy constructs
+        identify modernization opportunities
+        extract structural info
+        produce targets for planner
+    """
+
+    logger.info(">>> [ANALYZER] Starting structural analysis of source code")
+
+    code = state.get(
+
+        "code",
+
+        ""
+    )
+
     if not code:
-        logger.error("No code found in state to analyze")
+
+        logger.warning(
+
+            "[analyzer] empty source"
+        )
+
         return state
 
-    # Static analysis logic
-    try:
-        parser = CppParser()
-        functions_info = parser.parse_string(code, language="cpp")
-        
-        if not functions_info:
-            logger.warning("No functions/classes detected by minimal regex parser.")
-        
-        # Build dependency graph stub
-        graph = DependencyGraph(functions_info)
-        dependency_map = graph.build_map()
-        call_graph_data = graph.get_call_graph()
-        orphans = graph.get_orphans()
-        cycles = graph.get_cycles()
-        analysis_report = build_analysis_report(graph)
-        legacy_findings = detect_legacy_patterns(code)
-        
-        # Update state
-        state["functions_info"] = functions_info
-        state["dependency_map"] = dependency_map
-        state["call_graph_data"] = call_graph_data
-        state["orphans"] = orphans
-        state["cycles"] = cycles
-        state["analysis_report"] = analysis_report
-        state["legacy_findings"] = legacy_findings
-        
-        # Also need modernization_order if expected by later nodes
-        state["modernization_order"] = [fn["name"] for fn in functions_info]
-        
-        return state
 
-    except Exception as e:
-        logger.exception(f"Analyzer failed: {e}")
-        state["error_log"] = f"Analyzer error: {str(e)}"
-        return state
+    # ======================================================
+    # DETECT LEGACY PATTERNS
+    # ======================================================
+
+    findings: List[str] = []
+
+    findings.extend(
+
+        _detect_memory_patterns(code)
+    )
+
+    findings.extend(
+
+        _detect_cstyle_patterns(code)
+    )
+
+    findings.extend(
+
+        _detect_structural_patterns(code)
+    )
+
+
+    # ======================================================
+    # FUNCTION DISCOVERY
+    # ======================================================
+
+    functions = _extract_functions(code)
+
+
+    # ======================================================
+    # TARGET SELECTION
+    # ======================================================
+
+    targets = []
+
+    if any("malloc" in f for f in findings):
+
+        targets.append(
+
+            "memory_management"
+        )
+
+    if any("printf" in f for f in findings):
+
+        targets.append(
+
+            "iostream_upgrade"
+        )
+
+    if any("typedef" in f for f in findings):
+
+        targets.append(
+
+            "typedef_modernization"
+        )
+
+    if any("array" in f for f in findings):
+
+        targets.append(
+
+            "container_upgrade"
+        )
+
+
+    # fallback
+
+    if not targets:
+
+        targets.append(
+
+            "general_modernization"
+        )
+
+
+    # ======================================================
+    # RISK INDICATORS
+    # ======================================================
+
+    risk_flags = {
+
+        "manual_memory":
+
+            any(
+
+                x in code
+
+                for x in ["malloc", "new "]
+
+            ),
+
+        "global_state":
+
+            "static " in code,
+
+        "macro_usage":
+
+            "#define" in code,
+
+    }
+
+
+    # ======================================================
+    # STATE UPDATE
+    # ======================================================
+
+    state["legacy_findings"] = findings
+
+    state["functions_info"] = functions
+
+    state["modernization_targets"] = targets
+
+    state["risk_flags"] = risk_flags
+
+
+    # initialize empty structures used later
+
+    state.setdefault(
+
+        "dependency_graph",
+
+        {}
+    )
+
+    state.setdefault(
+
+        "semantic_report",
+
+        {}
+    )
+
+
+    # metrics integration
+
+    metrics = state.get(
+
+        "metrics",
+
+        {}
+    )
+
+    metrics["legacy_pattern_count"] = len(findings)
+
+    metrics["function_count"] = len(functions)
+
+    state["metrics"] = metrics
+
+
+    logger.info(f">>> [ANALYZER] Analysis complete: {len(findings)} legacy patterns found, {len(functions)} functions identified.")
+
+    return state

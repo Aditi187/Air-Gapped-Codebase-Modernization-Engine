@@ -550,7 +550,7 @@ def _extract_error_location(stderr_text: str, source_label: str) -> str | None:
 
 @dataclass
 class DifferentialTestResult:
-    parity_ok: bool
+    success: bool
     diff_text: str
     original: dict
     modernized: dict
@@ -583,7 +583,7 @@ def run_differential_test(
 
     if not os.path.isfile(original_cpp_path):
         return DifferentialTestResult(
-            parity_ok=False,
+            success=False,
             diff_text="",
             original={
                 "compile_success": False,
@@ -606,7 +606,7 @@ def run_differential_test(
 
     if not modernized_code.strip():
         return DifferentialTestResult(
-            parity_ok=False,
+            success=False,
             diff_text="",
             original={
                 "compile_success": False,
@@ -653,7 +653,7 @@ def run_differential_test(
         )
         if not original_compile.get("compile_success", False):
             return DifferentialTestResult(
-                parity_ok=False,
+                success=False,
                 diff_text="Original code failed to compile. Please fix legacy source before differential testing.",
                 original={
                     "compile_success": False,
@@ -690,7 +690,7 @@ def run_differential_test(
             if location:
                 modernized_stderr = modernized_stderr + "\n" + f"First error location: {location}"
             return DifferentialTestResult(
-                parity_ok=False,
+                success=False,
                 diff_text="Modernized code failed to compile. See compiler diagnostics.",
                 original={
                     "compile_success": True,
@@ -772,7 +772,7 @@ def run_differential_test(
             if not original_case_result.get("run_success", False):
                 reason = str(original_case_result.get("crash_reason") or "original runtime failure")
                 return DifferentialTestResult(
-                    parity_ok=False,
+                    success=False,
                     diff_text=(
                         f"Case {case_index}: original program runtime failure: {reason}.\n"
                         + str(original_case_result.get("stderr", ""))
@@ -802,7 +802,7 @@ def run_differential_test(
             if not modernized_case_result.get("run_success", False):
                 reason = str(modernized_case_result.get("crash_reason") or "modernized runtime failure")
                 return DifferentialTestResult(
-                    parity_ok=False,
+                    success=False,
                     diff_text=(
                         f"Case {case_index}: modernized program runtime failure: {reason}.\n"
                         + str(modernized_case_result.get("stderr", ""))
@@ -880,7 +880,7 @@ def run_differential_test(
                 memory_delta_kb = int(max_modernized_peak) - int(max_original_peak)
 
             return DifferentialTestResult(
-                parity_ok=False,
+                success=False,
                 diff_text="".join(diff_parts),
                 original={
                     "compile_success": True,
@@ -912,7 +912,7 @@ def run_differential_test(
         sanitizer_clean = len(all_sanitizer_findings) == 0
 
         return DifferentialTestResult(
-            parity_ok=sanitizer_clean,
+            success=sanitizer_clean,
             diff_text="" if sanitizer_clean else (
                 "All outputs matched, but sanitizer detected issues:\n"
                 + "\n".join(all_sanitizer_findings)

@@ -1,27 +1,9 @@
 # Core workflow
 langgraph
+pydantic
 
-# MCP tool server
-fastmcp
-
-# C++ parsing
-tree-sitter
-tree-sitter-cpp
-
-# Dependency graph
-networkx
-
-# Vector store (optional, used by ChromaDB-backed tools)
-chromadb
-
-# Embeddings (optional, used by CodeRAG)
-sentence-transformers
-
-# HTTP client (OpenRouter API)
+# HTTP client (NVIDIA API)
 requests
 
 # Environment variable loading
 python-dotenv
-
-# Observability
-langfuse>=2.0.0
